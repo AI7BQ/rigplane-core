@@ -422,9 +422,9 @@ describe('RadioLayout structure', () => {
   });
 
   // MOR-1313: `desktop-v2` resolves through its layout manifest now, so the
-  // receiver deck hosts the semantic surfaces. The LEGACY deck is what an
-  // undeclared layout gets — see `UNDECLARED` below and the full suppression
-  // matrix in `semantic-desktop-migration.component.test.ts`.
+  // receiver deck hosts the semantic surfaces. An undeclared layout gets an
+  // EMPTY deck since MOR-2728 — see `UNDECLARED` below and the full
+  // suppression matrix in `semantic-desktop-migration.component.test.ts`.
   it('wraps desktop-v2 in one host outside its receiver deck', () => {
     const t = mountLayout();
     const host = t.querySelector('[data-testid="semantic-radio-surfaces"]');
@@ -435,9 +435,13 @@ describe('RadioLayout structure', () => {
     expect(t.querySelector('.vfo-header')).toBeNull();
   });
 
-  it('renders .vfo-header inside .receiver-deck for an undeclared layout', () => {
+  // MOR-2728: the undeclared-layout branch and its legacy `<VfoHeader>` are
+  // deleted — an undeclared id renders an empty receiver deck, never a
+  // resurrected legacy twin.
+  it('renders an empty receiver deck, with no legacy .vfo-header, for an undeclared layout', () => {
     const t = mountLayout(UNDECLARED);
-    expect(t.querySelector('.receiver-deck .vfo-header')).not.toBeNull();
+    expect(t.querySelector('.receiver-deck')).not.toBeNull();
+    expect(t.querySelector('.receiver-deck .vfo-header')).toBeNull();
   });
 
   // MOR-2425 C-R3: `getWsConnected` is mocked false for this whole file, so
@@ -713,8 +717,7 @@ describe('App presentation selection', () => {
 // MOR-1341: `desktop-v2` (this file's `mountLayout()` default) now suppresses
 // `.bottom-dock` via its `meters` zone declaration. MOR-1346 gave `sdr-test`
 // one too, so `UNDECLARED` is now the layout that exercises the dock's OWN
-// behaviour — same move as `VfoHeader dual receiver` below, which tests the
-// legacy deck the same way.
+// behaviour.
 describe('Bottom dock MetersDockPanel', () => {
   it('renders the unified meters dock panel inside .bottom-dock', () => {
     const t = mountLayout(UNDECLARED);
@@ -757,24 +760,10 @@ describe('meters dock TX chrome follows the App TX authority (MOR-1235)', () => 
   });
 });
 
-// MOR-1313: the legacy VFO header lives on the undeclared branch now.
-describe('VfoHeader dual receiver', () => {
-  it('renders only one .panel in vfo-header when hasDualReceiver is false', () => {
-    vi.mocked(hasDualReceiver).mockReturnValue(false);
-    const t = mountLayout(UNDECLARED);
-    const vfoHeader = t.querySelector('.receiver-deck .vfo-header');
-    const panels = vfoHeader?.querySelectorAll('.panel');
-    expect(panels?.length).toBe(1);
-  });
-
-  it('renders two .panel elements in vfo-header when hasDualReceiver is true', () => {
-    vi.mocked(hasDualReceiver).mockReturnValue(true);
-    const t = mountLayout(UNDECLARED);
-    const vfoHeader = t.querySelector('.receiver-deck .vfo-header');
-    const panels = vfoHeader?.querySelectorAll('.panel');
-    expect(panels?.length).toBe(2);
-  });
-});
+// MOR-2728: the legacy `VfoHeader` deck and its undeclared-layout branch are
+// deleted; `semantic-desktop-migration.component.test.ts` and
+// `RadioLayout.command-bus-migration.isolated.test.ts` pin the deck renders
+// no legacy twin.
 
 describe('RadioLayout with radioState', () => {
   const sampleState = {
