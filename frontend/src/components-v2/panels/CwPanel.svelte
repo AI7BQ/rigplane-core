@@ -25,7 +25,10 @@
   const handlers = getCwHandlers();
   let p = $derived(deriveCwProps());
 
-  let breakIn = $derived(p.breakIn ?? 0);
+  // MOR-2729: an unread break-in stays null — a fabricated 0 would light
+  // the OFF choice before the radio reports anything. `null === choice.value`
+  // is false, so no button is lit while unread.
+  let breakIn = $derived(p.breakIn);
   let apfMode = $derived(p.apfMode ?? 0);
   let twinPeak = $derived(p.twinPeak ?? false);
   let currentMode = $derived(p.currentMode ?? 'CW');
@@ -262,13 +265,19 @@
     </div>
 
     <div class="toggle-row">
+      <!-- MOR-2729: the break-in control draws exactly the profile's
+           published choices (`breakInChoices` off `deriveCwProps`, empty on
+           X6100/X6200 ⇒ no key at all), never the v2 hard-coded trio. -->
       {#if showBreakIn}
-        <HardwareButton indicator="edge-left" active={breakIn === 1} color="cyan" onclick={() => onBreakInModeChange(breakIn === 1 ? 0 : 1)}>
-          SEMI
-        </HardwareButton>
-        <HardwareButton indicator="edge-left" active={breakIn === 2} color="orange" onclick={() => onBreakInModeChange(breakIn === 2 ? 0 : 2)}>
-          FULL
-        </HardwareButton>
+        {#each p.breakInChoices as choice (choice.value)}
+          <HardwareButton
+            indicator="edge-left" active={breakIn === choice.value}
+            color={choice.value === 0 ? 'cyan' : 'orange'}
+            onclick={() => onBreakInModeChange(choice.value)}
+          >
+            {choice.label}
+          </HardwareButton>
+        {/each}
       {/if}
       {#if showApf}
         <HardwareButton indicator="edge-left" active={apfActive} disabled={apfDisabled} title={apfDisabled ? 'APF only works in CW/CW-R' : null} color="cyan" onclick={() => onApfChange(apfMode > 0 ? 0 : 1)}>

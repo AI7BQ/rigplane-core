@@ -12,7 +12,8 @@
  */
 
 import type { ServerState, ReceiverState } from '$lib/types/state';
-import type { Capabilities, ControlDomain, FilterModeConfig } from '$lib/types/capabilities';
+import type { Capabilities, FilterModeConfig } from '$lib/types/capabilities';
+import type { BreakInChoice, ControlDomain } from '$lib/types/capabilities';
 import {
   controlDisplayDomain,
   deriveIfShift,
@@ -942,7 +943,11 @@ export function toTxProps(
 export interface CwProps {
   cwPitch: number;
   keySpeed: number;
-  breakIn: number;
+  /**
+   * MOR-2729 (review 2026-09-27): an unread break-in stays `number | null` —
+   * `null`, never the fabricated 0 that lights the OFF choice.
+   */
+  breakIn: number | null;
   apfMode: number;
   // `twinPeak` keeps its `boolean` (not `boolean | null`) contract — see
   // `toRitXitProps`' header comment: `CwPanel.svelte`'s `HardwareButton
@@ -967,6 +972,13 @@ export interface CwProps {
   hasBreakIn: boolean;
   hasApf: boolean;
   hasTwinPeak: boolean;
+  /**
+   * MOR-2729: the profile-declared break-in choices the panel's buttons
+   * must draw — `[]` when the radio declares no break-in domain (X6100,
+   * X6200) or publishes the field absence-treated as `[]`; no control at
+   * all either way.
+   */
+  breakInChoices: readonly BreakInChoice[];
   autoTuneAvailable: boolean;
   /**
    * The pitch control's display domain from the profile's `controls.cw_pitch`
@@ -988,7 +1000,6 @@ export function toCwProps(
   caps: Capabilities | null,
 ): CwProps {
   const rx = state ? activeRx(state) : null;
-  const breakInVal = state?.breakIn ?? 0;
   const mode = rx?.mode ?? 'USB';
   // Mode-gated CW filters (MOR-492): APF (Audio Peak Filter) is only meaningful
   // in CW/CW-R; TPF (Twin Peak Filter) only in RTTY/RTTY-R. Disable the control
@@ -1001,14 +1012,16 @@ export function toCwProps(
     // sidetone-level stand-ins for an unobserved CW receiver.
     cwPitch: state?.cwPitch ?? Number.NaN,
     keySpeed: state?.keySpeed ?? Number.NaN,
-    breakIn: breakInVal,
+    // MOR-2729: `null` is the unread sentinel — a comparison consumer can
+    // never light a choice for a reading that never arrived.
+    breakIn: state?.breakIn ?? null,
     apfMode: rx?.apfTypeLevel ?? 0,
     twinPeak: rx?.twinPeakFilter ?? false,
     currentMode: mode,
     apfDisabled,
     tpfDisabled,
     wpm: state?.keySpeed ?? Number.NaN,
-    breakInActive: breakInVal > 0,
+    breakInActive: (state?.breakIn ?? 0) > 0,
     breakInDelay: state?.breakInDelay ?? 0,
     sidetonePitch: state?.cwPitch ?? Number.NaN,
     sidetoneLevel: state?.monitorGain ?? Number.NaN,
@@ -1017,6 +1030,8 @@ export function toCwProps(
     hasBreakIn: hasCap(caps, 'break_in'),
     hasApf: hasCap(caps, 'apf'),
     hasTwinPeak: hasCap(caps, 'twin_peak'),
+    // MOR-2729: absent === empty === no break-in control (X6100, X6200).
+    breakInChoices: caps?.breakInChoices ?? [],
     autoTuneAvailable: hasCap(caps, 'cw')
       && hasCap(caps, 'audio')
       && caps?.audioFftAvailable === true,
@@ -1324,7 +1339,12 @@ export function toAmberTelemetryProps(state: ServerState | null): AmberTelemetry
 export interface VfoControlProps {
   mode: string;
   isCwMode: boolean;
-  breakInMode: number;
+  /** MOR-2729: an unread break-in stays null — the BK key derives no
+   *  fabricated "current" value to cycle from. */
+  breakInMode: number | null;
+  /** MOR-2729: the profile-declared break-in cycle domain — `[]` means no
+   *  break-in key at all (X6100, X6200). */
+  breakInChoices: readonly BreakInChoice[];
   hasDualRx: boolean;
   hasSplit: boolean;
   hasRit: boolean;
@@ -1344,12 +1364,14 @@ export function toVfoControlProps(
   return {
     mode,
     isCwMode: mode === 'CW' || mode === 'CW-R',
-    breakInMode: state?.breakIn ?? 0,
+    breakInMode: state?.breakIn ?? null,
     hasDualRx: hasCap(caps, 'dual_rx'),
     hasSplit: hasCap(caps, 'split'),
     hasRit: hasCap(caps, 'rit'),
     hasTuner: hasCap(caps, 'tuner'),
     hasCw: hasCap(caps, 'cw'),
     hasBreakIn: hasCap(caps, 'break_in'),
+    // MOR-2729: same absent === empty rule as the CW panel.
+    breakInChoices: caps?.breakInChoices ?? [],
   };
 }

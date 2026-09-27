@@ -31,9 +31,17 @@ import { flushSync, mount, unmount } from 'svelte';
 // @ts-expect-error -- Svelte does not publish types for its reactive test harness.
 import { proxy } from 'svelte/internal/client';
 import {
-  APF_CHOICES, BREAK_IN_CHOICES, BREAK_IN_REASON_KEY, CW_LEVELS, MUTEX_LABEL, POSTURE_LABEL,
+  APF_CHOICES, BREAK_IN_REASON_KEY, CW_LEVELS, MUTEX_LABEL, POSTURE_LABEL,
   breakInBlockedLabel, breakInPosture, textOf, type CwLevelField,
 } from '../CwKeyerSurface.svelte';
+/** The legacy trio, pinned locally so the surface's own export space stays
+ *  free of hard-coded choices (MOR-2729). */
+const BREAK_IN_CHOICES = [['off', 0], ['semi', 1], ['full', 2]] as const;
+type BreakInChoice = { value: number; label: string };
+/** MOR-2729: after the fallback deletion a prop-free render still needs the
+ *  choices it exercises, now passed EXPLICITLY. */
+const EXPLICIT_CHOICES: BreakInChoice[] =
+  BREAK_IN_CHOICES.map(([label, value]) => ({ value, label: label.toUpperCase() }));
 import CwKeyerInstrumentHostFixture from './fixtures/CwKeyerInstrumentHostFixture.svelte';
 import { topologyFixtures, withCwKeyer, withModeFilter, withTxAux } from '../fixtures/topologies';
 import type {
@@ -87,11 +95,22 @@ type Handlers = {
   onTwinPeakToggle?: () => void;
   onReversePaddleToggle?: () => void;
   breakInDelayFeedback?: Readonly<BreakInDelayFeedback>;
+  breakInChoices?: readonly BreakInChoice[];
   onAutoTune?: () => void;
 };
 
 function render(view: RadioViewModel, handlers: Handlers = {}) {
-  const component = mount(CwKeyerInstrumentHostFixture, { target, props: { view, ...handlers } });
+  // MOR-2729: the exported `BEFORE FIX` lookup is gone; every prop-free
+  // render still gets the choices it exercises, passed explicitly. A test
+  // pinning the absent field passes `breakInChoices: undefined`.
+  const component = mount(CwKeyerInstrumentHostFixture, {
+    target,
+    props: {
+      view,
+      breakInChoices: EXPLICIT_CHOICES,
+      ...handlers,
+    },
+  });
   flushSync();
   const q = <T extends HTMLElement>(sel: string) => target.querySelector(sel) as T | null;
   return {
@@ -281,9 +300,8 @@ describe('the CW-keyer surface is NOT a key path (decomposition R9)', () => {
     // controller, the transport or the permit utility any more than the fact
     // contract can.
     expect([...new Set(specifiers)]).toEqual([
-      '$lib/i18n', './CwKeyerInstrumentHost.svelte', './radio-view-model', './pressed-of',
-      '../primitives/reading-text',
-      'svelte',
+      '$lib/i18n', './CwKeyerInstrumentHost.svelte', '$lib/types/capabilities',
+      './radio-view-model', './pressed-of', '../primitives/reading-text', 'svelte',
       '../primitives/control-feedback/control-feedback-presentation',
       '../primitives/scalar/committed-scalar.svelte',
       '../primitives/scalar/value-control-core',
@@ -364,7 +382,7 @@ describe('the CW-keyer surface is NOT a key path (decomposition R9)', () => {
       'view', 'continuousHandles', 'showKeyerSpeed', 'showPitchHz', 'standard',
       'onBreakInMode', 'onLevelChange',
       'onApfOn', 'onTwinPeakToggle', 'onReversePaddleToggle', 'breakInDelayFeedback',
-      'autoTuneAvailable', 'onAutoTune',
+      'breakInChoices', 'autoTuneAvailable', 'onAutoTune',
     ]);
   });
 
@@ -865,6 +883,51 @@ describe('break-in obeys the ONE txPermit and fails closed', () => {
     r.dispose();
   });
 
+  /* MOR-2729 — the break-in choice list comes from the profile's published
+     `breakInChoices`, not the hard-coded trio. The prop-free renders above
+     pass the choices explicitly; these pin the profile path. */
+  describe('MOR-2729 — profile-published choices drive the break-in keys', () => {
+    const ftx1: BreakInChoice[] = [{ value: 0, label: 'OFF' }, { value: 1, label: 'ON' }];
+    const ic7300: BreakInChoice[] = [
+      { value: 0, label: 'OFF' }, { value: 1, label: 'SEMI' }, { value: 2, label: 'FULL' },
+    ];
+
+    it('FTX-1 lists OFF and ON only, and a click on ON dispatches mode 1', () => {
+      const onBreakInMode = vi.fn();
+      const r = render(base(), { breakInChoices: ftx1, onBreakInMode });
+      expect(r.el('break-in')).not.toBeNull();
+      expect(r.el('break-in-off')!.textContent).toBe('OFF');
+      expect(r.el('break-in-semi')!.textContent).toBe('ON');
+      expect(r.el('break-in-full')).toBeNull();
+      press(r.el('break-in-semi')!);
+      flushSync();
+      expect(onBreakInMode).toHaveBeenCalledExactlyOnceWith(1);
+      r.dispose();
+    });
+
+    it('IC-7300 keeps the published OFF / SEMI / FULL choices unchanged', () => {
+      const r = render(base(), { breakInChoices: ic7300 });
+      expect(r.el('break-in-off')!.textContent).toBe('OFF');
+      expect(r.el('break-in-semi')!.textContent).toBe('SEMI');
+      expect(r.el('break-in-full')!.textContent).toBe('FULL');
+      r.dispose();
+    });
+
+    it('a radio publishing an empty list (X6100, X6200) renders no break-in block at all', () => {
+      const r = render(base(), { breakInChoices: [] });
+      expect(r.el('break-in')).toBeNull();
+      r.dispose();
+    });
+
+    // Item 1 (review 2026-09-27): no `LEGACY_BREAK_IN_CHOICES` fallback — an
+    // absent field means NO break-in control, like `notchWidthChoices`.
+    it('an absent breakInChoices field renders no break-in control (MOR-2729)', () => {
+      const r = render(base(), { breakInChoices: undefined });
+      expect(r.el('break-in')).toBeNull();
+      r.dispose();
+    });
+  });
+
   // MOR-2690: the choices are KEYs, not radios — `aria-pressed` appears only
   // on a KNOWN reading, and `aria-checked` is gone entirely: a radio REQUIRES
   // `aria-checked`, and on an unread key a missing or `false` one reads as
@@ -882,12 +945,13 @@ describe('break-in obeys the ONE txPermit and fails closed', () => {
   // `aria-checked`, no radio role — and no wording claims a state.
   it('leaves every break-in key bare while the reading is unread', () => {
     const r = render(withCw({ breakIn: unread<BreakInMode>(DEGRADED) }));
+    const fallbackLabel: Record<string, string> = { off: 'OFF', semi: 'SEMI', full: 'FULL' };
     for (const [label] of BREAK_IN_CHOICES) {
       const key = r.el(`break-in-${label}`)!;
       expect(key.hasAttribute('aria-pressed')).toBe(false);
       expect(key.hasAttribute('aria-checked')).toBe(false);
       expect(key.getAttribute('role')).toBeNull();
-      expect(key.textContent).toBe(label);
+      expect(key.textContent).toBe(fallbackLabel[label]);
     }
     expect(r.el('break-in')!.querySelector('[role="radiogroup"]')).toBeNull();
     expect(r.el('break-in')!.querySelector('[role="group"]')).not.toBeNull();

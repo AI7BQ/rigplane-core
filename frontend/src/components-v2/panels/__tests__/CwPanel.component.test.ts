@@ -3,12 +3,18 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mount, unmount, flushSync } from 'svelte';
 import type { ControlFeedback } from '$lib/runtime/adapters/panel-adapters';
 import type { ControlDisplayDomain } from '$lib/radio/filter-controls';
+import { toCwProps } from '$lib/runtime/props/panel-props';
+import type { Capabilities } from '$lib/types/capabilities';
 
+const LEGACY_BREAK_IN: { value: number; label: string }[] = [
+  { value: 0, label: 'OFF' }, { value: 1, label: 'SEMI' }, { value: 2, label: 'FULL' },
+];
 const mockProps = {
   cwPitch: 600,
   keySpeed: 12,
-  breakIn: 0,
+  breakIn: 0 as number | null,
   breakInDelay: 0,
+  breakInChoices: LEGACY_BREAK_IN,
   apfMode: 0,
   twinPeak: false,
   currentMode: 'CW',
@@ -79,7 +85,7 @@ function mountPanel(overrides?: Partial<typeof mockProps>) {
   beforeEach(() => {
     components = [];
     Object.assign(mockProps, {
-      cwPitch: 600, keySpeed: 12, breakIn: 0, breakInDelay: 0,
+      cwPitch: 600, keySpeed: 12, breakIn: 0, breakInDelay: 0, breakInChoices: LEGACY_BREAK_IN,
       apfMode: 0, twinPeak: false, currentMode: 'CW',
       apfDisabled: false, tpfDisabled: false,
       hasCw: true, hasBreakIn: true, hasApf: true, hasTwinPeak: true,
@@ -185,6 +191,67 @@ describe('CwPanel component rendering', () => {
     const t = mountPanel();
     const buttons = Array.from(t.querySelectorAll('button'));
     expect(buttons.some((b) => b.textContent?.trim() === 'FULL')).toBe(true);
+  });
+
+  /* MOR-2729 — the break-in control offers exactly the profile's published
+     choices; the hard-coded OFF/SEMI/FULL trio is gone. */
+  it('FTX-1 lists OFF and ON only, and a click on ON dispatches set_break_in mode 1', () => {
+    const t = mountPanel({
+      breakInChoices: [{ value: 0, label: 'OFF' }, { value: 1, label: 'ON' }],
+      breakIn: 0,
+    });
+    const labels = Array.from(t.querySelectorAll('button')).map((b) => b.textContent?.trim());
+    expect(labels).toContain('OFF');
+    expect(labels).toContain('ON');
+    expect(labels).not.toContain('SEMI');
+    expect(labels).not.toContain('FULL');
+    findButton(t, 'ON').click();
+    expect(mockHandlers.onBreakInModeChange).toHaveBeenCalledExactlyOnceWith(1);
+  });
+
+  it('IC-7300 keeps the published OFF / SEMI / FULL choices', () => {
+    const t = mountPanel();
+    const labels = Array.from(t.querySelectorAll('button')).map((b) => b.textContent?.trim());
+    expect(labels).toContain('OFF');
+    expect(labels).toContain('SEMI');
+    expect(labels).toContain('FULL');
+    findButton(t, 'FULL').click();
+    expect(mockHandlers.onBreakInModeChange).toHaveBeenCalledExactlyOnceWith(2);
+  });
+
+  it('a radio publishing an empty break-in list (X6100, X6200) renders no break-in control', () => {
+    const t = mountPanel({ breakInChoices: [] });
+    const labels = Array.from(t.querySelectorAll('button')).map((b) => b.textContent?.trim());
+    for (const label of ['OFF', 'SEMI', 'FULL', 'ON']) expect(labels).not.toContain(label);
+  });
+
+  // Item 1 (review 2026-09-27): no LEGACY_BREAK_IN_CHOICES fallback — against
+  // the REAL toCwProps. Absent means an empty list means NO break-in control.
+  it('a capabilities payload with no breakInChoices field gets no break-in choices (MOR-2729)', () => {
+    const caps = { capabilities: ['cw', 'break_in'] } as unknown as Capabilities;
+    expect(toCwProps(null, caps).breakInChoices).toEqual([]);
+  });
+
+  /* Item 3 (review 2026-09-27): while break-in is unread no button is lit or
+     pressed; once read, the button of exactly that value is lit. */
+  it('an unread break-in lights no break-in button and presses none (MOR-2729)', () => {
+    const t = mountPanel({ breakIn: null });
+    expect(Array.from(t.querySelectorAll('button')).find((b) => b.textContent?.trim() === 'OFF')).toBeDefined();
+    expect(t.querySelector('[data-active="true"]')).toBeNull();
+    expect(t.querySelector('[aria-pressed="true"]')).toBeNull();
+  });
+
+  it('a read break-in lights exactly its own value: 0 lights OFF on the IC-7300 trio (MOR-2729)', () => {
+    const t = mountPanel({ breakIn: 0 });
+    expect(findButton(t, 'OFF').getAttribute('data-active')).toBe('true');
+  });
+
+  it('a read break-in lights exactly its own value: 1 lights ON on the FTX-1 pair (MOR-2729)', () => {
+    const t = mountPanel({
+      breakInChoices: [{ value: 0, label: 'OFF' }, { value: 1, label: 'ON' }],
+      breakIn: 1,
+    });
+    expect(findButton(t, 'ON').getAttribute('data-active')).toBe('true');
   });
 
   it('renders APF button', () => {
