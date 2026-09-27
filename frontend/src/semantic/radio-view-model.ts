@@ -25,6 +25,14 @@ export type ReceiverId = 'MAIN' | 'SUB';
 export type VfoSlotId = 'A' | 'B';
 
 /**
+ * The `kind` discriminants of `VfoSlot` as the run-time list the page
+ * guard's identifier vocabulary reads (MOR-2716) — the single source
+ * of truth the assertion below ties the union to.
+ */
+export const VFO_SLOT_KINDS = ['slotted', 'relative', 'unslotted', 'unknown'] as const;
+export type VfoSlotKind = (typeof VFO_SLOT_KINDS)[number];
+
+/**
  * Whether a VFO/target position has an addressable A/B slot at all, distinct
  * from whether that slot was actually observed. `unslotted` = the scheme has
  * no A/B concept here (`single`, `ab_shared`); `unknown` = a slotted scheme
@@ -36,6 +44,21 @@ export type VfoSlot =
   | { kind: 'relative'; role: 'selected' | 'unselected' }
   | { kind: 'unslotted' }
   | { kind: 'unknown' };
+
+/**
+ * Compile-time tie (MOR-2716): `VfoSlot`'s members carry different fields
+ * per kind, so the union cannot derive its discriminants from
+ * `VFO_SLOT_KINDS` directly. This assertion fails to compile whenever a
+ * `kind` exists on only one side — a fifth slot kind added to the union
+ * but not the array (or vice versa) cannot compile.
+ */
+type RequireTrue<Matches extends true> = Matches;
+export type VfoSlotKindsTiedToVfoSlot = RequireTrue<
+  (<G>() => G extends VfoSlot['kind'] ? 1 : 2) extends
+    (<G>() => G extends VfoSlotKind ? 1 : 2)
+    ? true
+    : false
+>;
 
 /** MOR-988 §3.2 `ActiveRx`, verbatim: an adapter with no observation must never fabricate 'MAIN'. */
 export type ActiveRx =
@@ -100,30 +123,47 @@ export interface VfoViewModel {
   isTxTarget: boolean;
 }
 
+/**
+ * The `status: 'unknown'` reason codes of `TxTargetViewModel` as the
+ * run-time list the page guard's identifier vocabulary reads (MOR-2716) —
+ * one source of truth: the `reason` union below is derived from this array.
+ */
+export const TX_TARGET_UNKNOWN_REASONS = [
+  'not-observed', 'stale', 'unsupported', 'contradiction',
+] as const;
+export type TxTargetUnknownReason = (typeof TX_TARGET_UNKNOWN_REASONS)[number];
+
 export type TxTargetViewModel =
   | { status: 'known'; receiver: ReceiverId; slot: VfoSlot; frequencyHz: number | null }
-  | { status: 'unknown'; reason: 'not-observed' | 'stale' | 'unsupported' | 'contradiction' };
+  | { status: 'unknown'; reason: TxTargetUnknownReason };
 
 export interface ScopeAvailabilityViewModel {
   hardwareScope: Availability;
   audioFftScope: Availability;
 }
 
-export type DisabledReasonCode =
-  | 'capability-unavailable'
-  | 'field-not-observed'
-  | 'tx-target-unknown'
-  | 'out-of-band'
+/**
+ * The disabled-reason codes the parser accepts, as the run-time list the
+ * page guard's identifier vocabulary reads (MOR-2716) — one source of
+ * truth: the `DisabledReasonCode` union is derived from this array.
+ */
+export const DISABLED_REASON_CODES = [
+  'capability-unavailable',
+  'field-not-observed',
+  'tx-target-unknown',
+  'out-of-band',
   /** MOR-1293: a hardware mutex with another control's CURRENT state
    *  disables this one (e.g. PREAMP while DIGI-SEL is on/unknown, MOR-479).
    *  Distinct from `capability-unavailable` (the control doesn't exist) and
    *  `field-not-observed` (this control's OWN reading is unobserved) —
    *  here the control itself is fine, a PEER control's state disables it. */
-  | 'mutually-exclusive-control'
+  'mutually-exclusive-control',
   /** MOR-2511 B2: the active receiver's profile does not declare this control
    *  (e.g. SUB.att/preamp on FTX-1). The control is structurally absent for
    *  this receiver regardless of the radio-wide capability. */
-  | 'receiver-lacks-control';
+  'receiver-lacks-control',
+] as const;
+export type DisabledReasonCode = (typeof DISABLED_REASON_CODES)[number];
 
 export interface DisabledReason {
   field: string;
@@ -1346,10 +1386,6 @@ export interface RadioViewModel {
 const RECEIVER_IDS: readonly ReceiverId[] = ['MAIN', 'SUB'];
 const SLOT_IDS: readonly VfoSlotId[] = ['A', 'B'];
 const VFO_SCHEMES: readonly VfoScheme[] = ['single', 'ab', 'ab_shared', 'main_sub'];
-const DISABLED_REASON_CODES: readonly DisabledReasonCode[] = [
-  'capability-unavailable', 'field-not-observed', 'tx-target-unknown', 'out-of-band',
-  'mutually-exclusive-control', 'receiver-lacks-control',
-];
 
 function oneOf<T>(value: unknown, allowed: readonly T[], path: string): T {
   if (!allowed.includes(value as T)) invalid(path, allowed.join(' | '));
