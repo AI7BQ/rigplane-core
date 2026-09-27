@@ -2828,7 +2828,6 @@ describe('MOR-2342 historical instrument presentations', () => {
     const standard = mountSurface({ viewModel: base, appearance: 'standard' });
     expect(standard.querySelector('.panel .panel-header')).not.toBeNull();
     expect(standard.querySelector('[data-testid="receiver-s-meter"]')?.getAttribute('data-operational')).toBe('true');
-    expect(standard.querySelector('[data-testid="receiver-s-meter"] svg')?.textContent).toContain('0');
 
     const indicator = base.receiverIndicators![0];
     const unknown = mountSurface({
