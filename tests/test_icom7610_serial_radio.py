@@ -32,7 +32,7 @@ from rigplane.runtime.managed_tx_composition import (
     ManagedTxComposition,
     install_managed_tx_composition,
 )
-from rigplane.runtime.managed_tx_state import ManagedTxOutcome
+from rigplane.runtime.managed_tx_state import ActuationResult, ManagedTxOutcome
 from rigplane.types import AudioCodec
 from rigplane.types import bcd_encode
 
@@ -139,6 +139,7 @@ class _FakeSerialCivLink:
         fail_connect_calls: set[int] | None = None,
         fail_connect_calls_exc: BaseException | None = None,
         lifecycle_events: list[tuple[str, object | None]] | None = None,
+        ptt_off_answer: int | None = 0xFB,
     ) -> None:
         self._fail_connect = fail_connect
         self._fail_connect_calls = set(fail_connect_calls or set())
@@ -153,6 +154,7 @@ class _FakeSerialCivLink:
         self._responses_by_send: dict[int, list[bytes]] = {}
         self.device_history: list[str] = []
         self.lifecycle_events = lifecycle_events
+        self.ptt_off_answer = ptt_off_answer
 
     def set_device(self, device: str) -> None:
         self.device_history.append(device)
@@ -187,6 +189,21 @@ class _FakeSerialCivLink:
         send_no = len(self.sent_frames)
         for response in self._responses_by_send.pop(send_no, []):
             self._responses.put_nowait(response)
+        # ``CoreRadio.actuate`` waits for the answer to the ``1C 00 00`` unkey
+        # and distrusts it while another write's answer may be unclaimed
+        # (MOR-2860), so the managed TX writes are answered here: FB for PTT ON
+        # (``1C 00 01``), stop CW (``17 FF``) and tuner off (``1C 01 00``), and
+        # ``ptt_off_answer`` for the unkey (``None`` answers nothing).
+        answer = {
+            b"\x1c\x00\x01": 0xFB,
+            b"\x17\xff": 0xFB,
+            b"\x1c\x01\x00": 0xFB,
+            b"\x1c\x00\x00": self.ptt_off_answer,
+        }.get(payload[4:-1])
+        if answer is not None:
+            self._responses.put_nowait(
+                bytes((0xFE, 0xFE, payload[3], payload[2], answer, 0xFD))
+            )
 
     async def send_written(
         self, frame: bytes, *, is_current: Callable[[], bool] | None = None
@@ -446,6 +463,29 @@ async def test_serial_disconnect_retires_composition_before_transport_close(
     close_index = lifecycle_events.index(("disconnect", None))
     assert off_index < retire_index < close_index
     await composition.shutdown(asyncio.Event())
+
+
+@pytest.mark.asyncio
+async def test_idle_force_off_on_an_answering_radio_leaves_no_debt(tmp_path) -> None:
+    """MOR-2860: an idle ForceOff that the radio answers with FB owes nothing."""
+    link = _FakeSerialCivLink()
+    radio = Icom7610SerialRadio(device="/dev/ttyUSB0", civ_link=link)
+    composition = ManagedTxComposition(radio, config_path=tmp_path / "managed-tx.json")
+    install_managed_tx_composition(radio, composition)
+    store = StateStore()
+    store.begin_provider_generation()
+    await composition.bind_state_store(store)
+    await radio.connect()
+    try:
+        assert await composition.authority.force_off() is ManagedTxOutcome.ACCEPTED
+        state = (await composition.authority.snapshot()).state
+    finally:
+        await radio.disconnect()
+        await composition.shutdown(asyncio.Event())
+
+    assert state.last_actuation is not None
+    assert state.last_actuation.result is ActuationResult.ACCEPTED
+    assert not state.release_required
 
 
 def test_serial_radio_rejects_unsupported_ptt_mode() -> None:
