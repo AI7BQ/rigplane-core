@@ -194,7 +194,39 @@ class RigctldClientObservationPoller:
                 raise
             except Exception:
                 logger.warning("rigctld-client observation poll failed", exc_info=True)
+                await self._reconnect_transport()
             await asyncio.sleep(interval)
+
+    async def _reconnect_transport(self) -> None:
+        """Reopen the transport a failed poll cycle left closed (MOR-2757).
+
+        A read timeout retires the connection
+        (``RigctldTransport._read_line`` → ``_close_connection``), and
+        nothing else in production reopens it — the reconnect loops in
+        ``runtime/radio_reconnect.py`` are Icom-only and the HTTP
+        ``/api/v1/radio/connect`` endpoint is operator-triggered — so
+        without this the next cycle would fail in ``_write_line`` without
+        ever querying rigctld again: one timeout ended polling for good.
+        Reuse the transport's own ``connect()`` — the same open path
+        startup uses — rather than a second reconnect mechanism; both
+        loops may race here, and its lifecycle lock plus the ``connected``
+        short-circuit make that safe. An *intentional* disconnect
+        (``RigctldClientRadio.disconnect``, e.g. the operator's
+        ``/api/v1/radio/disconnect``) is never undone here: the radio's
+        ``_intentional_disconnect`` flag — the IcomRadio idiom — makes
+        this return without reopening; the next ``connect()`` clears the
+        flag and polling resumes.
+        """
+
+        if self._radio._intentional_disconnect:
+            return
+        transport = self._radio._transport
+        if transport.connected:
+            return
+        try:
+            await transport.connect()
+        except Exception:
+            logger.warning("rigctld-client transport reconnect failed", exc_info=True)
 
     async def _poll_medium(self) -> None:
         from .observations import RigctldClientObservationAdapter
@@ -682,6 +714,16 @@ class RigctldClientRadio:
         self._model = model or "External rigctld"
         self._state = RadioState()
         self._vfo_supported = False
+        # MOR-2757: consecutive unanswered reads per safety-critical path,
+        # kept by the observation adapter (rebuilt every poll cycle) across
+        # cycles — the same "state lives on the radio" idiom as the Yaesu
+        # backend's tally. On the 3rd unanswered read the adapter records
+        # the declared-command defect that ends startup.
+        self._critical_read_timeouts: dict[FieldPath, int] = {}
+        # The same intentional-disconnect idiom as IcomRadio: set by
+        # disconnect(), cleared by connect(), checked by the poller's
+        # reconnect so an operator's disconnect is never undone.
+        self._intentional_disconnect = False
         self._physical_write_result_callback: (
             Callable[[PhysicalWriteReadbackResult], None] | None
         ) = None
@@ -709,9 +751,11 @@ class RigctldClientRadio:
 
     async def connect(self) -> None:
         await self._transport.connect()
+        self._intentional_disconnect = False
         await self._probe_vfo_support()
 
     async def disconnect(self) -> None:
+        self._intentional_disconnect = True
         await self._transport.close()
 
     async def __aenter__(self) -> "RigctldClientRadio":
