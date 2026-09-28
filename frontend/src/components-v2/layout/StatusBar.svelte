@@ -50,9 +50,17 @@
         return 'neutral';
     }
   }
+
+  // MOR-1240: the current owner of the document-level
+  // `--rp-status-bar-bottom` property. Module-level so every StatusBar
+  // instance sees the same token: whoever published last owns the
+  // property, and a destroying instance removes it only while it is
+  // still the owner (see the instance script).
+  let owner: symbol | null = null;
 </script>
 
 <script lang="ts">
+  import { onMount } from 'svelte';
   import { Radio, Cable, Activity, Volume2, ArrowDownUp, Power, Unplug, Palette, Monitor, Tv, Settings, Bug } from 'lucide-svelte';
   import ThemePicker from '../controls/ThemePicker.svelte';
   import ManagedTotStatusControl from '../controls/ManagedTotStatusControl.svelte';
@@ -377,12 +385,74 @@
     };
   });
 
+  // ── MOR-1240: publish this bar's bottom edge ──
+  // The powered-off overlay (AppGlobalHost) no longer measures the DOM
+  // looking for a status bar: that host-side lookup raced the lazily
+  // loaded presentation (power-off could be known before the skin chunk
+  // mounted this bar) and missed moves that resize nothing (the link-lost
+  // row above the bar shifts it without changing its box). Instead, while
+  // mounted, this bar PUBLISHES its own bottom edge as a document-level
+  // CSS custom property and the overlay only consumes it in CSS:
+  //   top: var(--rp-status-bar-bottom, 0px)
+  // A layout without a StatusBar (phone, cockpit, probe) never sets the
+  // property, so its overlay stays full-screen with no per-layout list
+  // anywhere.
+  const BOTTOM_EDGE_PROPERTY = '--rp-status-bar-bottom';
+
+  // Ownership is by token, not by value: two skins can publish the same
+  // bottom string, so the published value can never decide whose cleanup
+  // may remove the property. Each instance mints its own token (the
+  // module-level `owner` above records the last publisher), and a
+  // destroying instance removes the property only while it is still the
+  // owner.
+  const mine = Symbol('status-bar-bottom-edge');
+  let barEl: HTMLElement | undefined = $state();
+
+  function publishBottomEdge(): void {
+    if (!barEl) return;
+    owner = mine;
+    document.documentElement.style.setProperty(
+      BOTTOM_EDGE_PROPERTY,
+      `${Math.ceil(barEl.getBoundingClientRect().bottom)}px`,
+    );
+  }
+
+  // Mount and every appearance/disappearance of the link-lost row (which
+  // moves the bar without resizing it) republish, after the DOM update.
+  $effect(() => {
+    void (controlState === 'disconnected');
+    publishBottomEdge();
+  });
+
+  onMount(() => {
+    window.addEventListener('resize', publishBottomEdge);
+    let observer: ResizeObserver | null = null;
+    // jsdom has no ResizeObserver; the guard keeps the publish path testable.
+    if (typeof ResizeObserver !== 'undefined' && barEl) {
+      observer = new ResizeObserver(() => publishBottomEdge());
+      observer.observe(barEl);
+    }
+    return () => {
+      window.removeEventListener('resize', publishBottomEdge);
+      observer?.disconnect();
+      // Remove the property only while THIS instance still owns it: on a
+      // skin switch the next bar may already have published its own edge,
+      // and wiping the property then would re-cover the new bar's strip.
+      if (owner === mine) {
+        document.documentElement.style.removeProperty(BOTTOM_EDGE_PROPERTY);
+        owner = null;
+      }
+    };
+  });
+
 </script>
 
 {#if controlState === 'disconnected'}
   <div class="control-link-lost">{t('core.statusbar.controlLinkLost')}</div>
 {/if}
-<div class="status-bar">
+<!-- MOR-1240: this bar publishes `--rp-status-bar-bottom` while mounted;
+     AppGlobalHost's powered-off overlay consumes it in CSS. -->
+<div class="status-bar" bind:this={barEl}>
   <div class="status-indicators">
     <span class="indicator" role="status" title={radioHealthLabel ? t('core.statusbar.indicator.radioWithReason', { state: radioState, reason: radioHealthLabel }) : t('core.statusbar.indicator.radio', { state: radioState })} style="--indicator-color: {stateColor(radioIndicatorState)}">
       <span class="indicator-dot"></span>

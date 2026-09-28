@@ -10,7 +10,7 @@
  *   5. teardown unsubscribes exactly once and stays inert afterwards.
  */
 import { readFileSync } from 'node:fs';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushSync, mount, unmount } from 'svelte';
 import { ManagedAppTxHarness, type ManagedAppTxServerSnapshot } from '$lib/runtime/tx-controller/__tests__/support/managed-app-tx-harness';
 
@@ -154,7 +154,7 @@ function mountAt(component: typeof App | typeof AppGlobalHost) {
 const hostEl = () => document.querySelector('[data-testid="app-global-host"]');
 const txEl = () => document.querySelector('[data-testid="global-tx-indication"]');
 const faultEl = () => document.querySelector('[data-testid="global-tx-fault"]');
-const powerEl = () => document.querySelector('[data-testid="global-power-off"]');
+const powerEl = () => document.querySelector<HTMLElement>('[data-testid="global-power-off"]');
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -162,6 +162,8 @@ beforeEach(() => {
   h.radioPowerOn = null;
   h.ptt = false;
   document.body.innerHTML = '';
+  // MOR-1240: a failed earlier test may leave the edge property behind.
+  document.documentElement.style.removeProperty('--rp-status-bar-bottom');
   Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1200 });
   Object.defineProperty(window, 'innerHeight', { configurable: true, value: 800 });
   h.onMessage.mockReturnValue(h.offMessage);
@@ -387,6 +389,111 @@ describe('App composition — one host above the presentation boundary', () => {
     flushSync();
     expect(txEl()).toBeNull();
     expect(faultEl()).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// MOR-1240 — while the radio is powered off, the desktop status bar stays
+// usable; a layout without a status bar keeps the full-screen overlay.
+// The dependency is inverted (PR #3852 review): the host measures nothing —
+// StatusBar publishes `--rp-status-bar-bottom` while mounted and the overlay
+// only consumes it in CSS. The publish side is pinned in
+// StatusBar.bottom-edge-publish.component.test.ts; jsdom does no layout, so
+// what is assertable here is the CSS contract and the fallback.
+// ---------------------------------------------------------------------------
+describe('MOR-1240 — the powered-off overlay leaves the desktop status bar usable', () => {
+  const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), 'utf8');
+  const BOTTOM_EDGE = '--rp-status-bar-bottom';
+  const bottomEdge = () => document.documentElement.style.getPropertyValue(BOTTOM_EDGE);
+
+  function mountHost() {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+    const instance = mount(AppGlobalHost, { target });
+    flushSync();
+    return instance;
+  }
+
+  it('starts the overlay at the bar edge StatusBar publishes, through CSS alone', () => {
+    h.radioPowerOn = false;
+    // A mounted StatusBar (see the publish suite) is the only writer.
+    document.documentElement.style.setProperty(BOTTOM_EDGE, '34px');
+    const instance = mountHost();
+
+    expect(powerEl()?.style.top).toBe(`var(${BOTTOM_EDGE}, 0px)`);
+
+    document.documentElement.style.removeProperty(BOTTOM_EDGE);
+    unmount(instance);
+  });
+
+  it('keeps the full-screen overlay when no StatusBar is mounted', () => {
+    h.radioPowerOn = false;
+    const instance = mountHost();
+
+    expect(powerEl()).not.toBeNull();
+    // No bar publishes, so the variable is unset anywhere: the overlay's
+    // top collapses to the 0px fallback — full-screen.
+    expect(bottomEdge()).toBe('');
+    expect(powerEl()?.style.top).toBe(`var(${BOTTOM_EDGE}, 0px)`);
+
+    unmount(instance);
+  });
+
+  it('keeps its Power ON action from the host', async () => {
+    h.radioPowerOn = false;
+    h.powerOn.mockResolvedValue(undefined);
+    const instance = mountHost();
+
+    powerEl()?.querySelector<HTMLButtonElement>('.power-on-btn')?.click();
+    await settle();
+    expect(h.powerOn).toHaveBeenCalledTimes(1);
+
+    unmount(instance);
+  });
+
+  // The CSS contract the overlay relies on: StatusBar (and only StatusBar)
+  // writes the document-level edge property, and the phone layout composes
+  // no StatusBar at all — so it can never grow a top cut by accident.
+  it('pins the edge contract: StatusBar publishes it; AppGlobalHost only consumes it in CSS; the phone layout mounts no bar', () => {
+    const statusBar = read('../components-v2/layout/StatusBar.svelte');
+    expect(statusBar).toMatch(/--rp-status-bar-bottom/);
+    expect(statusBar).toMatch(/setProperty\(\s*BOTTOM_EDGE_PROPERTY/);
+    expect(statusBar).not.toMatch(/data-status-bar/);
+
+    const host = read('../AppGlobalHost.svelte');
+    expect(host).toContain(`var(${BOTTOM_EDGE}, 0px)`);
+    // The host must not measure: no DOM lookup for a bar, no observers.
+    expect(host).not.toMatch(/querySelector[^)]*status-bar/);
+    expect(host).not.toMatch(/ResizeObserver/);
+
+    expect(read('../components-v2/layout/MobileRadioLayout.svelte'))
+      .not.toMatch(/StatusBar\.svelte/);
+  });
+
+  it('App follows the bar: full-screen on the phone layout, which mounts no bar', async () => {
+    h.radioPowerOn = false;
+    const instance = mountAt(App);
+    await settle();
+    flushSync();
+
+    const resize = async (width: number) => {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: width });
+      window.dispatchEvent(new Event('resize'));
+      flushSync();
+      await settle();
+      flushSync();
+    };
+
+    // The desktop stub in this harness mounts no bar: nothing ever
+    // publishes the edge, so the overlay stays full-screen via the CSS
+    // fallback across a layout swap.
+    expect(bottomEdge()).toBe('');
+    await resize(390);
+    expect(document.querySelector('.layout-stub')?.getAttribute('data-skin')).toBe('mobile');
+    expect(document.querySelector('.status-bar')).toBeNull();
+    expect(bottomEdge()).toBe('');
+
+    unmount(instance);
   });
 });
 

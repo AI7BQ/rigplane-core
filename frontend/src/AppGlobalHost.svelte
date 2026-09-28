@@ -18,7 +18,9 @@
   import { getManagedAppTxController } from '$lib/runtime/tx-controller/managed-app-host';
   import { t } from '$lib/i18n';
 
-  let { showTxIndication = true }: { showTxIndication?: boolean } = $props();
+  let {
+    showTxIndication = true,
+  }: { showTxIndication?: boolean } = $props();
 
   // The App-owned TX controller (MOR-1008/MOR-982) is the ONLY legitimate
   // source for this lamp. Radio-state PTT is a command/readback echo that can
@@ -45,6 +47,17 @@
   // confirm did not appear and DISCONNECT did nothing; this surface
   // follows the same rule, reusing ConfirmDialog's error state.
   let powerOnFailed = $state<string | null>(null);
+
+  // MOR-1240: while powered off, the overlay's top edge follows the
+  // layout's real status bar through CSS alone: StatusBar publishes its
+  // bottom edge as a document-level custom property
+  // (`--rp-status-bar-bottom`, see StatusBar.svelte) while mounted, and the
+  // overlay consumes it with `top: var(--rp-status-bar-bottom, 0px)`. A
+  // layout without a bar (phone, dual-receiver-cockpit, flagship-probe)
+  // never sets the property, so the fallback keeps the overlay full-screen
+  // with no per-layout list here. The host measures nothing: a host-side
+  // lookup raced the lazily loaded presentation and missed bar moves that
+  // resize nothing (the link-lost row above the bar).
 
   async function handlePowerOn(): Promise<void> {
     try {
@@ -78,6 +91,7 @@
   {#if runtime.radioPowerOn === false}
     <div
       class="power-off-overlay"
+      style:top="var(--rp-status-bar-bottom, 0px)"
       role="dialog"
       aria-modal="true"
       data-testid="global-power-off"
@@ -177,6 +191,9 @@
     background: var(--danger, #b91c1c);
   }
 
+  /* `inset: 0` keeps the overlay full-screen; the inline `top` (the only
+     MOR-1240 edge) starts it below a mounted status bar via the
+     document-level `--rp-status-bar-bottom` StatusBar publishes. */
   .power-off-overlay {
     position: fixed;
     inset: 0;

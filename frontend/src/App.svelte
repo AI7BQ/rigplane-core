@@ -421,7 +421,9 @@
 {#if demoMode !== 'control-buttons' && !backendError}
   <!-- Global feedback / power-health / authoritative TX indication live here,
        as siblings of the presentation, so switching layout or skin never
-       recreates or duplicates them (MOR-1059). -->
+       recreates or duplicates them (MOR-1059). MOR-1240: the powered-off
+       overlay finds the layout's status bar itself — a layout without one
+       keeps the full-screen overlay. -->
   <AppGlobalHost showTxIndication={committedLayoutId !== 'desktop-v2'} />
   <LocalExtensionsHost />
 {/if}
