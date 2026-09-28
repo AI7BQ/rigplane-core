@@ -23,6 +23,7 @@ import {
   getRadioStatus,
   getRadioPowerOn,
 } from '$lib/stores/connection.svelte';
+import { isRxSilent } from '$lib/stores/rx-silence.svelte';
 import {
   getAudioState,
   getRxAudioTargetSnapshot,
@@ -214,6 +215,8 @@ class FrontendRuntime {
 
   get connectionWs(): boolean { return getWsConnected(); }
   get connectionAudio(): boolean { return isAudioConnected(); }
+  /** MOR-2792: server RX capture is digital silence. */
+  get rxSilent(): boolean { return isRxSilent(); }
   get connectionStale(): boolean { return isStale(); }
   get connectionReconnecting(): boolean { return isReconnecting(); }
   get radioStatus(): string { return getRadioStatus(); }

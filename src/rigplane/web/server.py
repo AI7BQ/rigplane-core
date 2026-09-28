@@ -662,13 +662,16 @@ def _supports_audio(radio: "Radio | None") -> bool:
     return "audio" in runtime_capabilities(radio)
 
 
-def _audio_session_event_json(event: AudioSessionEvent) -> dict[str, Any]:
+def _audio_session_event_json(
+    event: AudioSessionEvent, *, rx_silent: bool = False
+) -> dict[str, Any]:
     """JSON shape shared by the runtime payload and the WS event (MOR-581)."""
     return {
         "state": event.state.value,
         "reason": event.reason,
         "leg": event.leg,
         "timestamp": event.timestamp,
+        "rxSilent": rx_silent,
     }
 
 
@@ -2888,7 +2891,11 @@ class WebServer:
             self._watched_audio_session = None
 
     def _on_audio_session_event(self, event: "AudioSessionEvent") -> None:
-        self.broadcast_event("audio_session", _audio_session_event_json(event))
+        session = self._watched_audio_session
+        rx_silent = bool(getattr(session, "rx_silent", False)) if session else False
+        self.broadcast_event(
+            "audio_session", _audio_session_event_json(event, rx_silent=rx_silent)
+        )
 
     def _attach_reconnect_status_listener(self) -> None:
         """Forward radio reconnect-status updates to control WS clients and
@@ -3537,11 +3544,40 @@ class WebServer:
         if not isinstance(session, AudioSession):
             return {"enabled": False}
         event = session.last_event
+        rx_silent = bool(getattr(session, "rx_silent", False))
         return {
             "enabled": True,
             "state": session.state.value,
-            "lastEvent": None if event is None else _audio_session_event_json(event),
+            "lastEvent": (
+                None
+                if event is None
+                else _audio_session_event_json(event, rx_silent=rx_silent)
+            ),
+            "rxSilent": rx_silent,
         }
+
+    def current_audio_session_event_json(self) -> dict[str, Any] | None:
+        """Connect-time audio-session snapshot in the edge event shape (MOR-2792).
+
+        A page that opens the control channel after the silence edge must still
+        see the live ``rxSilent`` value. Same JSON as the ``audio_session`` edge
+        (``_audio_session_event_json``); ``None`` when no session is attached.
+        """
+        radio = self._radio
+        session = getattr(radio, "_audio_session", None) if radio is not None else None
+        if not isinstance(session, AudioSession):
+            return None
+        rx_silent = bool(getattr(session, "rx_silent", False))
+        event = session.last_event
+        if event is None:
+            # No edge yet — synthesize so ``rxSilent`` still reaches the client.
+            event = AudioSessionEvent(
+                state=session.state,
+                reason="snapshot",
+                leg="rx",
+                timestamp=time.monotonic(),
+            )
+        return _audio_session_event_json(event, rx_silent=rx_silent)
 
     def _runtime_connection_payload(self) -> dict[str, Any]:
         """Connection/reconnect status block for the runtime payload (MOR-594).
