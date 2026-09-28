@@ -2420,6 +2420,31 @@ class CivRuntime:
                         frame=frame,
                     )
                 )
+                # MOR-2503: a fixed-width mode has no width readback (the
+                # CI-V 1A 03 table has no FM row), but the profile declares
+                # each slot's width. Publishing the declared slot width here
+                # — marked ``declared``, never ``confirmed`` — lets the
+                # passband draw without inventing a width for modes that
+                # declare none.
+                profile = getattr(self._host, "_profile", None)
+                declared = (
+                    profile.declared_filter_width(mode_val.name, int(filt))
+                    if profile is not None
+                    else None
+                )
+                if declared is not None:
+                    observations.append(
+                        self._observation(
+                            self._freq_mode_path(
+                                receiver_id=receiver_id,
+                                slot_override=slot_override,
+                                name="filter_width",
+                            ),
+                            declared,
+                            frame=frame,
+                            quality=("declared",),
+                        )
+                    )
         elif frame.command == 0x25 and len(frame.data) >= 6:
             relative = (
                 getattr(self._host._profile, "vfo_readback", "none")
@@ -2652,17 +2677,21 @@ class CivRuntime:
         elif frame.command == 0x1A and frame.sub == 0x03 and frame.data:
             # Filter width: profile-dependent CI-V index → Hz, reusing the exact
             # decode + receiver/profile context of ``_handle_1a`` (MOR-437).
-            observations.append(
-                self._observation(
-                    self._freq_mode_path(
-                        receiver_id=receiver_id,
-                        slot_override=slot_override,
-                        name="filter_width",
-                    ),
-                    self._decode_filter_width(frame),
-                    frame=frame,
+            # MOR-2503: in a fixed-width mode the index maps to no Hz (the rule
+            # has no ``segments``), so a non-NG answer would publish a raw
+            # index over the declared width — publish nothing there instead.
+            if not self._fixed_filter_width_mode(frame):
+                observations.append(
+                    self._observation(
+                        self._freq_mode_path(
+                            receiver_id=receiver_id,
+                            slot_override=slot_override,
+                            name="filter_width",
+                        ),
+                        self._decode_filter_width(frame),
+                        frame=frame,
+                    )
                 )
-            )
         elif frame.command == 0x1A and frame.sub == 0x04 and frame.data:
             # AGC time constant: 1-byte BCD, same decode as ``_handle_1a``.
             observations.append(
@@ -3006,8 +3035,7 @@ class CivRuntime:
         Profile-dependent: ``segmented_bcd_index`` BCD-decodes the response
         byte, while ``raw_byte_index`` uses the first data byte directly. The
         resulting index is mapped to Hz via the mode/data-mode filter rule.
-        Shared by ``_observations_from_frame`` and ``_handle_1a`` so both
-        produce a byte-for-byte identical value (MOR-437).
+        Shared by ``_observations_from_frame`` and ``_handle_1a`` (MOR-437).
         """
 
         from rigplane.commands import _bcd_decode_value, filter_index_to_hz
@@ -3031,6 +3059,26 @@ class CivRuntime:
                 return int(filter_index_to_hz(filter_index, segments=rule.segments))
             return filter_index
         return filter_index
+
+    def _fixed_filter_width_mode(self, frame: CivFrame) -> bool:
+        """Whether the frame's receiver sits in a fixed-width mode (MOR-2503).
+
+        A fixed-width mode's filter rule has no ``segments``, so a
+        0x1A/0x03 index cannot be mapped to Hz —
+        :meth:`_decode_filter_width` would return the raw index. True only
+        when a profile rule resolves and is fixed; an unknown mode keeps
+        the raw-index fallback.
+        """
+
+        profile = getattr(self._host, "_profile", None)
+        if profile is None:
+            return False
+        rx = self._resolve_filter_width_receiver(frame)
+        rule = profile.resolve_filter_rule(
+            getattr(rx, "mode", None),
+            data_mode=int(getattr(rx, "data_mode", 0) or 0),
+        )
+        return rule is not None and rule.fixed
 
     def _resolve_filter_width_receiver(self, frame: CivFrame) -> Any:
         """Resolve the RadioState receiver providing mode/data_mode context."""
