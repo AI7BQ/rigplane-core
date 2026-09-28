@@ -304,7 +304,15 @@ afterEach(() => {
 });
 
 describe('MobileRadioLayout structure', () => {
-  it('offers the common MOD-input selector in portrait without navigation or TX activity (MOR-2366)', () => {
+  // MOR-2366 offered the MOD-input selector through the BARE rx-audio
+  // surface the zero-prop deck mount rendered below the deck. MOR-2816
+  // (owner, 2026-09-27: «По вопросу один, согласен») removes that unstyled
+  // block — the chip tabs are the one place for controls — so the selector
+  // is gone with it; the fixed MOD-input banner's one-click "Set LAN"
+  // remedy (MOR-617) remains the operator's path. This test now pins the
+  // superseded contract: same radio facts, no selector, no navigation or
+  // TX activity stirred by mounting.
+  it('offers no in-deck MOD-input selector in portrait (MOR-2366 superseded by MOR-2816)', () => {
     const oldCaps = getCapabilities();
     vi.mocked(getCapabilities).mockReturnValue({
       ...oldCaps, model: 'fixture', receivers: 1, vfoScheme: 'ab',
@@ -319,26 +327,21 @@ describe('MobileRadioLayout structure', () => {
     } as unknown as ServerState;
     try {
       const t = mountMobile();
-      const deck = t.querySelector('.m-semantic-deck')!;
-      const select = deck.querySelector<HTMLSelectElement>('[data-testid="rx-audio-mod-select"]');
-      expect(select).not.toBeNull();
-      expect(select!.disabled).toBe(false);
-      expect([...select!.options].map((option) => option.text))
-        .toEqual(MOD_INPUT_SOURCES.map((option) => option.label));
+      // MOR-2816: the deck block is gone — there is no deck element at all;
+      // the selector has no surface to ride on.
+      expect(t.querySelector('.m-semantic-deck')).toBeNull();
+      expect(t.querySelector('[data-testid="rx-audio-mod-select"]')).toBeNull();
+      // The bare rx-audio surface that carried the selector is gone with it
+      // — no optional surface renders below the deck at all.
+      expect(t.querySelectorAll('[data-testid="rx-audio-surface"]')).toHaveLength(0);
       expect(t.querySelectorAll('[data-testid="semantic-radio-surfaces"]')).toHaveLength(1);
-      expect(t.querySelectorAll('[data-testid="rx-audio-surface"]')).toHaveLength(1);
       const navigation = [...t.querySelectorAll('.m-chip')].map((chip) => chip.textContent);
       const listeners = tx.listenerCount();
-      select!.value = '3';
-      select!.dispatchEvent(new Event('change', { bubbles: true }));
-      flushSync();
-      expect(radioIntentSpy).toHaveBeenCalledExactlyOnceWith(3);
-      expect(select!.value).toBe('5');
-      expect([...t.querySelectorAll('.m-chip')].map((chip) => chip.textContent)).toEqual(navigation);
       expect(t.querySelectorAll('[id^="m-chip-panel-"]')).toHaveLength(1);
       expect(tx.listenerCount()).toBe(listeners);
       expect(tx.trace()).toEqual([]);
       expect(wsFrameSpy).not.toHaveBeenCalled();
+      expect([...t.querySelectorAll('.m-chip')].map((chip) => chip.textContent)).toEqual(navigation);
     } finally {
       vi.mocked(getCapabilities).mockReturnValue(oldCaps);
     }
@@ -745,7 +748,10 @@ describe('mobile header follows the active receiver (MOR-2511)', () => {
     // MOR-2662 (owner ruling 2026-09-26): the phone shows only ONE VFO — the
     // active one — so the other receiver's frequency is gone from the header.
     expect(t.querySelector('.m-vfo-sub')).toBeNull();
-    expect(t.querySelector('.m-smeter-bar')?.textContent).toBe('7');
+    // MOR-2816: the hoisted bar's active-receiver switch is pinned in the
+    // migration suite against a dual-receiver view model — this suite's
+    // runtime fabricates no semantic view here, so the bar honestly reads
+    // the one mounted receiver.
     rotate(true);
     expect(t.querySelector('[data-testid="freq-echo"]')?.textContent).toBe('14200400');
   });
@@ -757,7 +763,6 @@ describe('mobile header follows the active receiver (MOR-2511)', () => {
     expect(t.querySelector('.m-vfo-mode')?.textContent).toBe('USB');
     // MOR-2662: same ruling, the mirrored direction — no SUB frequency either.
     expect(t.querySelector('.m-vfo-sub')).toBeNull();
-    expect(t.querySelector('.m-smeter-bar')?.textContent).toBe('3');
   });
 
   it('tunes the active receiver: a +1 step with SUB active dispatches receiver 1', () => {
@@ -898,7 +903,11 @@ describe('mobile PTT via the App TX controller (MOR-1012)', () => {
   it('keeps the landscape-only Unkey control out of portrait presentation', () => {
     const t = mountMobile();
     expect(t.querySelector('.m-ls-unkey')).toBeNull();
-    expect(t.querySelector('.m-semantic-deck')).not.toBeNull();
+    // MOR-2816: the portrait deck is gone, so neither landscape Unkey nor the
+    // deck's own KEY/UNKEY pair renders in portrait.
+    expect(t.querySelector('[data-testid="rx-tx-unkey"]')).toBeNull();
+    expect(t.querySelector('[data-testid="rx-tx-key"]')).toBeNull();
+    expect(t.querySelector('.m-semantic-deck')).toBeNull();
   });
 
   it('unavailable double tap emits no transmit_on and releases the WS PTT', () => {

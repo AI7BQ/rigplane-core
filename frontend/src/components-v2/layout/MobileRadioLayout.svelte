@@ -6,6 +6,9 @@
   import SpectrumPanel from '../../components/spectrum/SpectrumPanel.svelte';
   import FrequencyDisplay from '../display/FrequencyDisplay.svelte';
   import LinearSMeter from '../meters/LinearSMeter.svelte';
+  // MOR-2816: the hoisted bar renders the card meter's own face — the same
+  // frame contract the VFO surface's receiver instruments hand their meter.
+  import type { SignalMeterFrame } from '../meters/signal-meter-motion.svelte';
   import CollapsiblePanel from '../controls/CollapsiblePanel.svelte';
   import BottomSheet from '../controls/BottomSheet.svelte';
   import BandSelector from '../controls/BandSelector.svelte';
@@ -704,37 +707,68 @@
     </div>
   </header>
 
-  <!-- ═══ S-METER BAR ═══ -->
-  <div class="m-smeter-bar">
-    <LinearSMeter value={finiteValue(activeVfo.sValue)} compact label="" />
-  </div>
+  <!-- ═══ SEMANTIC BODY (MOR-2816) ═══
+       ONE mount hosts the whole portrait body. The hosted `children`
+       composition means the mount renders ONLY what this snippet places —
+       the chip tabs are the one place for controls (owner rulings,
+       2026-09-27 and 2026-09-28), so the portrait-deck zone's vfo + rxTx
+       surfaces render NOWHERE on the phone: the header carries the active
+       VFO, the chips carry its controls, and the FAB / TX chip carry TX. -->
+  <SemanticRadioSurfaces scopeManaged
+    bind:managedScopeRegion={managedScopeRegion} suppressModInputTxWarning>
+    {#snippet children(instruments: InstrumentComposition)}
+      <!-- The receiver the header reads — the hoisted meter follows it, the
+           same way the retired value-fed strip followed the active VFO. -->
+      {@const meterReceiver = activeReceiver === 'SUB' && instruments.receiverInstruments.subSMeter
+        ? 'SUB'
+        : 'MAIN'}
+      {#snippet hoistedMeterFrame(frame: SignalMeterFrame)}
+        <LinearSMeter {frame} compact
+          lowerScale={instruments.receiverInstruments.powerLowerScaleFor?.(meterReceiver)}
+          variant="vfo-wide" />
+      {/snippet}
 
-  <!-- ═══ SCROLLABLE CONTENT ═══ -->
-  <main class="m-content">
+      <!-- ═══ S-METER BAR (MOR-2816) ═══
+           The receiver meter the VFO card's block used to carry, hoisted
+           into the retired strip's slot — the same component (LinearSMeter,
+           compact vfo-wide, the Po lower scale), fed by the same view model
+           through the mount's receiverInstruments handles, so there is no
+           second meter implementation. Since the 2026-09-28 ruling removed
+           the VFO card itself, this bar is the phone's only S-meter. -->
+      <div class="m-smeter-bar" data-receiver={meterReceiver}>
+        {#if meterReceiver === 'SUB'}
+          {@render instruments.receiverInstruments.subSMeter!(hoistedMeterFrame)}
+        {:else}
+          {@render instruments.receiverInstruments.mainSMeter(hoistedMeterFrame)}
+        {/if}
+      </div>
 
-    <!-- Spectrum / Waterfall — MOR-2511: absent entirely on a radio without
-         a spectrum; pinned by the no-spectrum orientation tests in
-         MobileRadioLayout.component.svelte.test.ts. -->
-    {#if hasSpectrum()}
-      <section class="m-spectrum">
-        <SpectrumPanel hideAutoStepToggle={true}
-          scopeProjection={managedScopeRegion?.projection}
-          scopeDemanded={managedScopeRegion?.demanded ?? true}
-          onScopeDemandChange={managedScopeRegion?.setDemand} />
-      </section>
-    {/if}
+      <!-- ═══ SCROLLABLE CONTENT ═══ -->
+      <main class="m-content">
 
-    <!-- The semantic deck and PTT gesture both use the single App-root managed
-         intent facade; the deck adds no transport or authority. -->
-    <section class="m-semantic-deck">
-      <!-- MOR-1245 — this shell mounts its OWN fixed-position copy below
-           (`.m-mod-input-warning`, both orientations), so the shared
-           wiring's instance suppresses itself. The mounting tests pin one
-           rendered banner per orientation. -->
-      <SemanticRadioSurfaces scopeManaged vfoTiles="active" bind:managedScopeRegion={managedScopeRegion} suppressModInputTxWarning />
-    </section>
+        <!-- Spectrum / Waterfall — MOR-2511: absent entirely on a radio without
+             a spectrum; pinned by the no-spectrum orientation tests in
+             MobileRadioLayout.component.svelte.test.ts. -->
+        {#if hasSpectrum()}
+          <section class="m-spectrum">
+            <SpectrumPanel hideAutoStepToggle={true}
+              scopeProjection={managedScopeRegion?.projection}
+              scopeDemanded={managedScopeRegion?.demanded ?? true}
+              onScopeDemandChange={managedScopeRegion?.setDemand} />
+          </section>
+        {/if}
 
-    <!-- Chip-scroll IA nav (#839) -->
+        <!-- MOR-2816 (owner ruling 2026-09-28): the portrait VFO / RX-TX deck
+             block is removed — the active VFO lives in the header, its
+             controls in the chip tabs, TX in the FAB and the TX chip. The
+             only tenant left is the MOR-1784 TX-fault recovery: one short
+             line the shared wiring renders only while a fault is active,
+             directly above the chip row. No new mechanism — the existing
+             txFaultRecovery path, and the PTT gesture keeps using the single
+             App-root managed intent facade. -->
+        {@render instruments.txFaultRecovery()}
+
+        <!-- Chip-scroll IA nav (#839) -->
     <MobileChipBar
       chips={mobileChips}
       activeId={activeChipId}
@@ -859,6 +893,8 @@
       </section>
     {/if}
   </main>
+    {/snippet}
+  </SemanticRadioSurfaces>
 
   <!-- ═══ TUNING STRIP ═══ -->
   <nav class="m-tuning-strip">
@@ -1447,7 +1483,11 @@
 
   .m-smeter-bar {
     flex-shrink: 0;
-    padding: 2px 4px;
+    /* MOR-2816 (owner, 2026-09-27): the CONTAINER alone is tightened —
+       padding only. The bar, its scale numerals and its text keep the
+       sizes the VFO card's block drew («просто контейнер ужать, не саму
+       полосу S-метра»). */
+    padding: 0 4px;
     background: var(--v2-bg-darker, #0a0a14);
     border-bottom: 1px solid var(--v2-border-darker, #1a1a2e);
   }
@@ -1467,20 +1507,13 @@
     display: none;
   }
 
-  /* ── Semantic deck (MOR-1094) ── */
-  /* The surfaces declare `height: 100%`, which inside the scrolling
-     `.m-content` would resolve to the full viewport. An auto-height wrapper
-     resolves that percentage to `auto` and keeps the deck the size of its
-     content, above the chip bar. Same slot idiom as the LCD control column. */
-  .m-semantic-deck {
-    padding: 6px 8px;
-    border-bottom: 1px solid var(--v2-border-darker, #222);
-  }
-
-  /* ── Spectrum ── */
+  /* ── Spectrum ──
+     MOR-2816: the box grew from 220px to 260px so the one-row scrolling
+     toolbar's own 44-64px band leaves the panorama (spectrum + waterfall)
+     at least 190 CSS px at the 375px portrait width. */
   .m-spectrum {
-    height: 220px;
-    min-height: 180px;
+    height: 260px;
+    min-height: 254px;
     border-bottom: 1px solid var(--v2-border-darker, #222);
   }
 
@@ -1794,5 +1827,79 @@
 
   .m-mode-grid > :global(button) {
     min-height: 44px;
+  }
+
+  /* ── MOR-2816 (owner ruling 2026-09-28): portrait button floors ──
+     Every visible button inside the PORTRAIT phone root — chip tabs,
+     chip panels, the spectrum toolbar mounted in .m-content, sheets and
+     modals opened from the phone — carries a label of at least 16px
+     and a touch height of at least 44px. Rows may wrap or drop buttons
+     per row; no label is clipped or ellipsised. Scoped to the portrait
+     phone only: desktop, reference and LCD layouts and the .m-landscape
+     arrangement keep their own sizes. The floors also reach the two
+     button mounts that sit OUTSIDE the .m-layout scroll root — the
+     floating MOD-input warning banner (.m-mod-input-warning, whose own
+     labels were 11-12px) and the PTT FAB button — so no portrait phone
+     button escapes them. `!important` is required because
+     the shared spectrum toolbar pins some button fonts at 8–9px and the
+     global control-button face pins nowrap + overflow:hidden on the
+     button itself, and `max(16px, 1em)` keeps any already-larger label
+     (e.g. the sheet close glyph) at its own size. */
+  .m-layout :global(button),
+  .m-layout :global([role='button']),
+  .m-mod-input-warning :global(button),
+  :global(.ptt-fab) {
+    font-size: max(16px, 1em) !important;
+    min-height: 44px !important;
+    min-width: 44px;
+    white-space: normal !important;
+    overflow: visible !important;
+    text-overflow: clip !important;
+  }
+
+  /* Glyph-only buttons (◀ ▶ ⚙ ⛶): the glyph itself keeps the 16px
+     floor — lucide icons carry their size as width/height attributes,
+     so a min box enlarges the small ones without touching bigger ones. */
+  .m-layout :global(button svg),
+  .m-layout :global([role='button'] svg) {
+    min-width: 16px;
+    min-height: 16px;
+  }
+
+  /* The shared spectrum toolbar: ONE row that scrolls horizontally —
+     the 16px/44px floors made a wrapping toolbar 4-5 rows tall and
+     ate the panorama box. The row keeps its own 44-64px band above the
+     fixed-height spectrum area, so the panorama is untouched by it. */
+  .m-layout :global(.spectrum-toolbar) {
+    height: auto;
+    min-height: 44px;
+    max-height: 64px;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .m-layout :global(.toolbar-group),
+  .m-layout :global(.toolbar-group-b),
+  .m-layout :global(.toolbar-group-c),
+  .m-layout :global(.toolbar-group-d) {
+    height: auto;
+    min-height: 44px;
+    flex-shrink: 0;
+  }
+
+  .m-layout :global(.toolbar-separator),
+  .m-layout :global(.toolbar-sub-separator) {
+    flex-shrink: 0;
+  }
+
+  /* The FAB's label span (PTT / TX LOCK) is not a button element, so the
+     button font floor above never reached it — it keeps its own 16px
+     floor inside the unchanged 72px FAB. The FAB is the only PttFab mount
+     in the app (portrait phone only), so the bare anchor reaches exactly
+     its label span, which sits outside the .m-layout scroll root. */
+  :global(.ptt-fab-label) {
+    font-size: max(16px, 1em) !important;
   }
 </style>

@@ -5,8 +5,11 @@
  * SAFETY-ADJACENT. The mobile shell carries the operator's press-and-hold PTT,
  * and this slice also renders the semantic RX/TX surface, which emits a
  * latched TRANSMIT intent. Four things must hold at once:
- *   1. the semantic VFO / RX-TX surfaces are mounted in the portrait deck via
- *      the unchanged `SemanticRadioSurfaces` wiring — no new TX code path;
+ *   1. the portrait body is hosted by the unchanged `SemanticRadioSurfaces`
+ *      wiring, which since MOR-2816 (owner ruling 2026-09-28) renders NO
+ *      VFO / RX-TX deck surface in portrait — the header carries the active
+ *      VFO, the chip tabs carry the controls, and only the MOR-1784
+ *      TX-fault recovery line stays between the panorama and the chips;
  *   2. the press-and-hold path is still the MOR-1011/1012 gesture recognizer
  *      feeding the App-root managed controller — pinned by wire intent;
  *   3. momentary WS PTT and latched HTTP TRANSMIT/ForceOFF remain distinct,
@@ -196,7 +199,11 @@ import { hasTx, getScopeSource, getCapabilities, hasDualReceiver } from '$lib/st
 import { radio } from '$lib/stores/radio.svelte';
 import { deriveModInputTxGuardProps } from '$lib/runtime/adapters/mod-input-tx-guard.svelte';
 import { toRadioViewModel } from '$lib/runtime/adapters/radio-view-model-adapter';
-import { topologyFixtures } from '../../../semantic/fixtures/topologies';
+import {
+  topologyFixtures, withTxAux, withMeters, withRxAudio, withModeFilter,
+  withFilterPassband, withDsp, withRfFrontEnd, withBand, withRitXit,
+  withAntenna, withCwKeyer, withScan, withScopeControls, withScopeDisplay,
+} from '../../../semantic/fixtures/topologies';
 
 const RX: ManagedTxState = Object.freeze({
   phase: 'idle', intent: null, radioTx: 'off', txRisk: 'none', fault: null,
@@ -266,23 +273,12 @@ function fabPress(t: HTMLElement) {
   flushSync();
 }
 
-/** Press and hold the FAB until the managed gesture emits PTT ON. */
+/**
+ * Press and hold the FAB until the managed gesture emits PTT ON.
+ */
 async function hold(t: HTMLElement) {
   fabPress(t);
   await flushAudio();
-}
-
-/**
- * Key through the semantic RX/TX surface. An authoritative readback comes
- * first because the surface refuses its own key action while the RF state is
- * unobserved (`rf-state-unknown`) — asserting the button is live keeps a
- * silently-disabled button from making these tests pass vacuously.
- */
-function semanticKey(t: HTMLElement) {
-  const key = t.querySelector<HTMLButtonElement>('[data-testid="rx-tx-key"]')!;
-  expect(key.disabled).toBe(false);
-  key.click();
-  flushSync();
 }
 
 beforeEach(() => {
@@ -308,20 +304,28 @@ afterEach(() => {
 describe('semantic VFO / RX-TX adoption in the mobile shell', () => {
   // Kills: the migration never landing — the shell keeping only its legacy
   // header facts and the FAB as its sole TX truth.
-  it('mounts the semantic surfaces in the portrait deck', () => {
+  // MOR-2816 (owner ruling 2026-09-28): the portrait deck block is removed
+  // — the mount itself stays (it hosts the scroll deck and the hoisted
+  // S-meter), but neither required surface renders in portrait.
+  it('hosts the wiring once and renders no VFO or RX/TX surface in portrait', () => {
     const t = mountMobile();
     expect(t.querySelectorAll('[data-testid="semantic-radio-surfaces"]')).toHaveLength(1);
-    expect(t.querySelectorAll('[data-testid="rx-tx-surface"]')).toHaveLength(1);
+    expect(t.querySelectorAll('[data-testid="vfo-surface"]')).toHaveLength(0);
+    expect(t.querySelectorAll('[data-testid="rx-tx-surface"]')).toHaveLength(0);
   });
 
   // Kills: mounting the surfaces inside a chip panel. Chip panels are
   // destroyed and recreated on every chip tap, and this subtree holds a TX
   // lease source — churning it would churn a TX identity (MOR-1086 doctrine).
-  it('mounts them in the scrollable deck, not inside a chip panel', () => {
+  // MOR-2816: the mount now HOSTS the whole portrait body (the S-meter slot
+  // above the scroll deck and `main.m-content` inside it), so the invariant
+  // is stated from the same two facts the old form stated: never inside a
+  // chip panel, and the scroll deck lives inside the one mount.
+  it('mounts them outside every chip panel, hosting the scroll deck (MOR-2816)', () => {
     const t = mountMobile();
     const surfaces = t.querySelector('[data-testid="semantic-radio-surfaces"]')!;
-    expect(t.querySelector('.m-content')!.contains(surfaces)).toBe(true);
     expect(surfaces.closest('.m-section')).toBeNull();
+    expect(t.querySelector('.m-content')!.closest('[data-testid="semantic-radio-surfaces"]')).toBe(surfaces);
   });
 
   // Kills: adding a second copy of the wiring (one per orientation, or one
@@ -359,26 +363,17 @@ describe('MOR-2662 — the phone shows only the active VFO', () => {
     vi.mocked(toRadioViewModel).mockReturnValue(topologyFixtures['1/single']);
   });
 
-  // Kills: the deck still drawing BOTH VFO tiles below the header.
-  it('portrait renders exactly one VFO tile — the active receiver\'s active slot', () => {
-    vi.mocked(toRadioViewModel).mockReturnValue(topologyFixtures['2/main_sub']);
-    const t = mountMobile();
-    const tiles = t.querySelectorAll('[data-vfo-tile]');
-    expect(tiles).toHaveLength(1);
-    expect(tiles[0].getAttribute('data-vfo-receiver')).toBe('MAIN');
-    expect(tiles[0].getAttribute('data-vfo-active')).toBe('true');
-    expect(tiles[0].getAttribute('data-vfo-active-slot')).toBe('true');
-  });
-
-  // The single-receiver A/B shape: the active SLOT's tile alone survives.
-  it('portrait renders the active slot only on a slotted A/B radio', () => {
-    vi.mocked(toRadioViewModel).mockReturnValue(topologyFixtures['1/ab']);
-    const t = mountMobile();
-    const tiles = t.querySelectorAll('[data-vfo-tile]');
-    expect(tiles).toHaveLength(1);
-    expect(tiles[0].getAttribute('data-vfo-slot')).toBe('A');
-    expect(tiles[0].getAttribute('data-vfo-active')).toBe('true');
-  });
+  // MOR-2816 (owner ruling 2026-09-28): the deck's VFO tiles went with the
+  // deck. The header's active frequency is the phone's only VFO in portrait,
+  // on every topology.
+  it.each([['1/ab'], ['2/main_sub']] as const)(
+    'portrait renders no VFO tiles — the header carries the active frequency alone (%s)', (key) => {
+      vi.mocked(toRadioViewModel).mockReturnValue(topologyFixtures[key]);
+      const t = mountMobile();
+      expect(t.querySelectorAll('[data-vfo-tile]')).toHaveLength(0);
+      expect(t.querySelector('.m-vfo-freq')).not.toBeNull();
+    },
+  );
 
   // Kills: the landscape overlay re-adding a second VFO surface.
   it('landscape renders no VFO tiles — the strip shows the active frequency alone', () => {
@@ -389,11 +384,156 @@ describe('MOR-2662 — the phone shows only the active VFO', () => {
     expect(t.querySelector('.m-ls-vfo')).not.toBeNull();
   });
 
-  // Kills: a future edit dropping the option and silently restoring two
-  // tiles. The one-tile phone is a presentation OPTION the shell passes,
-  // never a fork of the shared surface.
-  it('passes the one-tile presentation option to the shared wiring', () => {
-    expect(mobileLayoutSource).toContain('vfoTiles="active"');
+  // Kills: a future edit re-adding the portrait deck render — the vfo/rxTx
+  // snippets reaching the phone again after MOR-2816 removed them.
+  it('renders neither semantic deck surface in portrait (MOR-2816)', () => {
+    expect(mobileLayoutSource).not.toContain('instruments.vfo(');
+    expect(mobileLayoutSource).not.toContain('instruments.rxTx(');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 1d. MOR-2816 (owner ruling 2026-09-27) — the portrait deck mounts ONLY its
+//     declared zone (portrait-deck = vfo + rxTx). No optional surface renders
+//     bare below the deck: the chip tabs are the one place for controls. The
+//     receiver S-meter the VFO surface's MAIN block carried is hoisted into
+//     the bar under the frequency header — the same component, fed by the
+//     same view model — and the in-card seat is gone.
+// ---------------------------------------------------------------------------
+describe('MOR-2816 — the phone deck mounts only its declared zone', () => {
+  // The optional surfaces the bare single-composition path renders below
+  // the deck on a fully-populated view model. Each landmark must be GONE;
+  // the two required surfaces must still render.
+  const OPTIONAL_SURFACE_LANDMARKS = [
+    'rx-audio-surface', 'filter-surface', 'dsp-surface',
+    'rf-front-end-surface', 'band-surface', 'antenna-surface',
+    'ritxit-scan-surface', 'cw-keyer-surface', 'tx-aux-surface', 'meters-surface',
+    'scope-display-surface', 'scope-controls-surface',
+  ] as const;
+
+  // The base topology fixtures carry NO optional groups, so the base mock
+  // would make every landmark assertion below pass vacuously. Compose every
+  // optional group onto `1/single` — the radio the owner measured on
+  // 2026-09-27 had every one of these surfaces rendering bare.
+  const fullyLoadedView = withScopeDisplay(withScopeControls(withScan(
+    withCwKeyer(withAntenna(withRitXit(withBand(withRfFrontEnd(
+      withDsp(withFilterPassband(withModeFilter(
+        withRxAudio(withMeters(withTxAux(topologyFixtures['1/single']))))))))))))));
+
+  // Kills: any surface regressing onto the phone's bare path — the unstyled
+  // control block the owner measured on 2026-09-27, or the VFO / RX-TX deck
+  // block the owner ordered removed on 2026-09-28.
+  it('renders no surface below the panorama — neither optional nor the deck pair', () => {
+    const restore = vi.mocked(toRadioViewModel).getMockImplementation();
+    vi.mocked(toRadioViewModel).mockReturnValue(fullyLoadedView);
+    try {
+      const t = mountMobile();
+      for (const landmark of OPTIONAL_SURFACE_LANDMARKS) {
+        expect(t.querySelectorAll(`[data-testid="${landmark}"]`), landmark).toHaveLength(0);
+      }
+      expect(t.querySelectorAll('[data-testid="vfo-surface"]')).toHaveLength(0);
+      expect(t.querySelectorAll('[data-testid="rx-tx-surface"]')).toHaveLength(0);
+    } finally {
+      vi.mocked(toRadioViewModel).mockImplementation(restore ?? (() => topologyFixtures['1/single']));
+    }
+  });
+
+  // Kills: a second meter implementation, or the hoisted bar keeping a twin
+  // in the VFO card's receiver-indicator block. The bar under the header is
+  // the SAME receiver meter the card carried — same view model, one mount —
+  // and the card's in-card seat is withheld. The view carries the
+  // receiver-indicator group so the in-card seat WOULD render without the
+  // withholding option (no vacuous pass).
+  it('hoists the receiver S-meter to the bar under the header, leaving no in-card meter', () => {
+    const indicatorField = <T>(value: T) => ({
+      reading: { status: 'known' as const, value },
+      availability: { structural: true, operational: true },
+    });
+    const cardMeterView = {
+      ...topologyFixtures['1/single'],
+      receiverIndicators: [{
+        receiver: 'MAIN' as const,
+        availability: { structural: true, operational: true },
+        sMeter: {
+          ...indicatorField(0),
+          source: {
+            providerGeneration: 1, scope: 'receiver' as const, receiver: 'MAIN' as const,
+            path: 'main.sMeter' as const,
+          },
+        },
+        bandwidthHz: indicatorField(2400),
+        agcMode: indicatorField(0),
+        nbActive: indicatorField(false),
+        nrActive: indicatorField(false),
+        notchMode: indicatorField<'off' | 'auto' | 'manual'>('off'),
+        attenuator: indicatorField(0),
+        preamp: indicatorField(0),
+        rfGain: indicatorField(0),
+        digiSel: indicatorField(false),
+        ipPlus: indicatorField(false),
+      }],
+    };
+    const restore = vi.mocked(toRadioViewModel).getMockImplementation();
+    vi.mocked(toRadioViewModel).mockReturnValue(cardMeterView);
+    try {
+      const t = mountMobile();
+      const bar = t.querySelector('.m-smeter-bar');
+      expect(bar).not.toBeNull();
+      // The bar sits inside the one semantic mount, before the scroll deck.
+      expect(bar!.closest('[data-testid="semantic-radio-surfaces"]')).not.toBeNull();
+      const content = t.querySelector('.m-content')!;
+      expect(bar!.compareDocumentPosition(content) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      // The in-card seat the VFO surface's MAIN block used to carry is gone.
+      expect(t.querySelectorAll('[data-testid="receiver-s-meter"]')).toHaveLength(0);
+      expect(t.querySelectorAll('[data-testid="receiver-s-meter-unknown"]')).toHaveLength(0);
+    } finally {
+      vi.mocked(toRadioViewModel).mockImplementation(restore ?? (() => topologyFixtures['1/single']));
+    }
+    // The bar is the SAME receiver meter the card carried — one mount, no
+    // second implementation — and keeps the card meter's own face (the same
+    // compact `vfo-wide` variant the card rendered). Since MOR-2816 removed
+    // the VFO card itself, "no in-card seat" means no card at all.
+    expect(mobileLayoutSource).toContain('variant="vfo-wide"');
+  });
+
+  // Kills: the hoisted bar showing the wrong receiver on a dual-receiver
+  // radio — it follows the ACTIVE receiver, the same receiver the header
+  // reads (the retired value-fed strip's contract, MOR-2511).
+  it('the hoisted bar follows the active receiver on a dual-receiver radio', () => {
+    const restore = vi.mocked(toRadioViewModel).getMockImplementation();
+    vi.mocked(toRadioViewModel).mockReturnValue(topologyFixtures['2/main_sub']);
+    radio.current = { active: 'SUB' } as unknown as ServerState;
+    try {
+      const t = mountMobile();
+      expect(t.querySelector('.m-smeter-bar')?.getAttribute('data-receiver')).toBe('SUB');
+    } finally {
+      radio.current = null;
+      vi.mocked(toRadioViewModel).mockImplementation(restore ?? (() => topologyFixtures['1/single']));
+    }
+  });
+
+  // MOR-2816 (owner ruling 2026-09-28): the deck is gone down to the one
+  // thing that must survive it — the MOR-1784 TX-fault recovery, one short
+  // line rendered only while a TX fault is active, directly above the chip
+  // row, through the existing txFaultRecovery path (no new mechanism).
+  it('renders the TX-fault recovery line only while a fault is active, directly above the chip row', () => {
+    const t = mountMobile();
+    // No fault: nothing between the panorama and the chip row.
+    expect(t.querySelectorAll('[data-testid="tx-fault-recovery"]')).toHaveLength(0);
+    // A failed managed TX state raises the line through the existing path.
+    tx.project({ ...RX, phase: 'failed', fault: 'release failed', releaseRequired: true });
+    const fault = t.querySelector('[data-testid="tx-fault-recovery"]');
+    expect(fault).not.toBeNull();
+    // The existing wiring element — the recovery note, not a new one.
+    expect(fault!.querySelector('[data-testid="tx-fault-reset-blocked"]')).not.toBeNull();
+    // Directly above the chip row: the fault line is the chip bar's
+    // immediately preceding element inside the scroll deck.
+    const chipBar = t.querySelector('.m-chip-bar')!;
+    expect(chipBar).not.toBeNull();
+    expect(chipBar.previousElementSibling).toBe(fault);
+    // Fault cleared: the line goes with it.
+    tx.project(RX);
+    expect(t.querySelectorAll('[data-testid="tx-fault-recovery"]')).toHaveLength(0);
   });
 });
 
@@ -567,10 +707,16 @@ describe('mobile managed TX intent routing', () => {
     expect(tx.forceOff).not.toHaveBeenCalled();
   });
 
-  it('emits one HTTP TRANSMIT intent from the semantic key and no WS PTT', () => {
+  // MOR-2816 (owner ruling 2026-09-28): KEY/UNKEY TRANSMITTER and the TX
+  // target line went with the portrait deck — the phone's transmit surface
+  // is the PTT FAB (portrait) and the PTT strip (landscape) alone, and
+  // mounting the shell stirs no TX activity.
+  it('offers no KEY/UNKEY TRANSMITTER control in portrait and emits nothing by mounting', () => {
     const t = mountMobile();
-    semanticKey(t);
-    expect(tx.transmitOn).toHaveBeenCalledTimes(1);
+    expect(t.querySelectorAll('[data-testid="rx-tx-key"]')).toHaveLength(0);
+    expect(t.querySelectorAll('[data-testid="rx-tx-unkey"]')).toHaveLength(0);
+    expect(t.textContent).not.toContain('TX target');
+    expect(tx.transmitOn).not.toHaveBeenCalled();
     expect(tx.pttOn).not.toHaveBeenCalled();
     expect(tx.pttOff).not.toHaveBeenCalled();
     expect(tx.forceOff).not.toHaveBeenCalled();
@@ -631,9 +777,10 @@ describe('orientation change preserves App authority (MOR-1086 doctrine)', () =>
     rotate(false);
     expect(txHost.current).toBe(before);
     expect(txHost.current).toBe(tx.facade);
-    // And the shell is still live on it: a post-rotation key still lands.
-    semanticKey(t);
-    expect(tx.transmitOn).toHaveBeenCalledTimes(1);
+    // And the shell is still live on it: a post-rotation FAB press still
+    // lands on the same controller.
+    fabPress(t);
+    expect(tx.pttOn).toHaveBeenCalledTimes(1);
   });
 
   // Kills: treating every semantic mount as selected LCD demand. Explicit

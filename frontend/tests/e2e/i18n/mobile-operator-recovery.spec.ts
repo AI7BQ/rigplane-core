@@ -102,82 +102,295 @@ test('saved mobile theme survives cold entry, reload and desktop round trip', as
   expect(writes).toEqual([]);
 });
 
-async function checkUnkey(page: Page, info: TestInfo, stage: string, landscape: boolean, tab = true) {
-  const unkey = page.locator('[data-testid="rx-tx-unkey"], .m-ls-unkey');
-  await expect(unkey).toHaveCount(1);
-  // MOR-2347's pin: the full semantic deck lives only in portrait; landscape
-  // never mounts one. MOR-2442 keeps that — landscape hosts exactly ONE
-  // SemanticRadioSurfaces in its spectrum slot (hosted through the `children`
-  // snippet), and it
-  // renders no deck surfaces there. Portrait still mounts exactly one.
-  const surfaces = page.getByTestId('semantic-radio-surfaces');
-  await expect(surfaces).toHaveCount(1);
-  if (landscape) {
-    const hosted = page.locator('.m-ls-spectrum [data-testid="semantic-radio-surfaces"]');
-    await expect(hosted).toHaveCount(1);
-    await expect(hosted.getByTestId('rx-tx-surface')).toHaveCount(0);
-  }
-  await expect(unkey).toBeEnabled();
-  if (tab) {
-    // Tab to the existing recovery control without activating any control.
-    await page.locator('body').click({ position: { x: 1, y: 1 } });
-    for (let index = 0; index < 100; index++) {
-      await page.keyboard.press('Tab');
-      if (await unkey.evaluate((el) => el === document.activeElement)) break;
+// MOR-2816 (owner, 2026-09-27): the phone is minimal — one scroll container,
+// and the receiver S-meter sits in the old strip's slot above the scope
+// toolbar. Measured against the iPhone 13 profile's portrait viewport.
+test('one scroll container and the S-meter above the scope toolbar (MOR-2816)', async ({ page }, info) => {
+  const writes = await prepare(page);
+  await page.setViewportSize({ width: 390, height: 664 });
+  await page.goto('/');
+  await settled(page);
+  const geometry = await page.evaluate(() => {
+    const scrollers: string[] = [];
+    for (const el of Array.from(document.querySelectorAll<HTMLElement>('*'))) {
+      if (el.scrollHeight <= el.clientHeight + 1) continue;
+      const style = getComputedStyle(el);
+      if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+        scrollers.push(`${el.tagName.toLowerCase()}${el.classList[0] ? `.${el.classList[0]}` : ''}`);
+      }
     }
-  } else {
-    await unkey.evaluate((el) => (el as HTMLElement).blur());
-    await unkey.focus();
+    const doc = document.scrollingElement as HTMLElement;
+    const bar = document.querySelector('.m-smeter-bar')?.getBoundingClientRect();
+    const toolbar = document.querySelector('.spectrum-toolbar')?.getBoundingClientRect();
+    const header = document.querySelector('.m-vfo-bar')?.getBoundingClientRect();
+    return {
+      documentScrolls: doc.scrollHeight > doc.clientHeight + 1,
+      documentScrollHeight: doc.scrollHeight,
+      documentClientHeight: doc.clientHeight,
+      scrollers,
+      bar: bar?.toJSON(),
+      toolbar: toolbar?.toJSON(),
+      header: header?.toJSON(),
+    };
+  });
+  writeFileSync(info.outputPath('mor-2816-geometry.json'), JSON.stringify(geometry, null, 2));
+  await info.attach('geometry', { body: JSON.stringify(geometry), contentType: 'application/json' });
+  // One scroll container: the document does not scroll, and exactly one
+  // element — main.m-content — does.
+  expect(geometry.documentScrolls).toBe(false);
+  expect(geometry.scrollers).toEqual(['main.m-content']);
+  // The S-meter sits between the frequency header and the scope toolbar.
+  expect(geometry.bar).toBeDefined();
+  expect(geometry.toolbar).toBeDefined();
+  expect(geometry.header).toBeDefined();
+  expect(geometry.bar!.bottom).toBeLessThanOrEqual(geometry.toolbar!.top);
+  expect(geometry.header!.bottom).toBeLessThanOrEqual(geometry.bar!.top);
+  expect(writes).toEqual([]);
+});
+
+// MOR-2816 (owner ruling 2026-09-28): the portrait VFO / RX-TX deck block is
+// gone — no VFO or RX/TX surface, no KEY/UNKEY TRANSMITTER, no TX target
+// line between the panorama and the chip row. The hoisted S-meter and the one
+// scroller stay (pinned by the geometry test above).
+async function checkPortraitMinimal(page: Page) {
+  await expect(page.getByTestId('vfo-surface')).toHaveCount(0);
+  await expect(page.getByTestId('rx-tx-surface')).toHaveCount(0);
+  await expect(page.locator('[data-testid="rx-tx-key"], [data-testid="rx-tx-unkey"]')).toHaveCount(0);
+  await expect(page.getByText(/TX target/)).toHaveCount(0);
+  await expect(page.locator('.m-smeter-bar')).toBeVisible();
+  await expect(page.getByTestId('semantic-radio-surfaces')).toHaveCount(1);
+}
+
+// The only unkey left is the landscape strip's (MOR-2816). MOR-2347's pin
+// still holds: landscape hosts exactly ONE SemanticRadioSurfaces in its
+// spectrum slot and renders no deck surfaces there.
+async function checkLandscapeUnkey(page: Page, info: TestInfo, stage: string) {
+  const unkey = page.locator('.m-ls-unkey');
+  await expect(unkey).toHaveCount(1);
+  const hosted = page.locator('.m-ls-spectrum [data-testid="semantic-radio-surfaces"]');
+  await expect(hosted).toHaveCount(1);
+  await expect(hosted.getByTestId('rx-tx-surface')).toHaveCount(0);
+  await expect(unkey).toBeEnabled();
+  await page.locator('body').click({ position: { x: 1, y: 1 } });
+  for (let index = 0; index < 100; index++) {
+    await page.keyboard.press('Tab');
+    if (await unkey.evaluate((el) => el === document.activeElement)) break;
   }
   await expect(unkey).toBeFocused();
   await page.screenshot({ path: info.outputPath(`${stage}.png`) });
   const geometry = await unkey.evaluate((el) => {
     const rect = el.getBoundingClientRect();
-    const dock = document.querySelector('.m-tuning-strip')?.getBoundingClientRect();
-    const content = document.querySelector('.m-content')?.getBoundingClientRect();
+    const viewport = { width: innerWidth, height: innerHeight };
     const points = [[rect.x + rect.width / 2, rect.y + rect.height / 2],
       [rect.left + 10, rect.top + rect.height / 2], [rect.right - 10, rect.top + rect.height / 2]];
-    return { rect: rect.toJSON(), dock: dock?.toJSON(), content: content?.toJSON(),
-      viewport: { width: innerWidth, height: innerHeight },
+    return { rect: rect.toJSON(), viewport,
       hits: points.map(([x, y]) => el.contains(document.elementFromPoint(x, y))) };
   });
   writeFileSync(info.outputPath(`${stage}.json`), JSON.stringify(geometry, null, 2));
   await info.attach(stage, { body: JSON.stringify(geometry), contentType: 'application/json' });
   expect.soft(geometry.hits, stage).toEqual([true, true, true]);
-  expect.soft(geometry.rect.top, stage).toBeGreaterThanOrEqual(geometry.content?.top ?? 0);
-  expect.soft(geometry.rect.bottom, stage).toBeLessThanOrEqual(geometry.dock?.top ?? geometry.viewport.height);
   expect.soft(geometry.rect.left, stage).toBeGreaterThanOrEqual(0);
   expect.soft(geometry.rect.right, stage).toBeLessThanOrEqual(geometry.viewport.width);
-  if (geometry.content && geometry.dock) {
-    expect.soft(geometry.content.bottom, stage).toBeLessThanOrEqual(geometry.dock.top);
-    expect.soft(geometry.dock.bottom, stage).toBeLessThanOrEqual(geometry.viewport.height);
+}
+
+// MOR-2816 (owner ruling 2026-09-28 00:27 EDT): every visible button in the
+// PORTRAIT phone layout — chip tabs, chip panels, the spectrum toolbar, the
+// tuning strip — carries a label of at least 16px, a touch height of at least
+// 44px, and is not clipped. Glyph-only buttons keep a 44px hit area and a
+// glyph of at least 16px. Landscape is measured but deliberately unchanged.
+type ButtonAudit = {
+  label: string;
+  className: string;
+  font: number;
+  width: number;
+  height: number;
+  clipped: boolean;
+  glyphs: { width: number; height: number }[];
+};
+
+function auditScript(): ButtonAudit[] {
+  // MOR-2816: the audit walks EVERY phone root, not only the arrangement
+  // roots — the floating MOD-input warning banner (.m-mod-input-warning)
+  // and the PTT FAB button sit outside .m-layout/.m-landscape, so a single
+  // root query never saw their buttons. The FAB root IS the button, so a
+  // root that matches the selector set is audited itself.
+  const roots = Array.from(document.querySelectorAll<HTMLElement>(
+    '.m-layout, .m-landscape, .m-mod-input-warning, .ptt-fab',
+  ));
+  if (roots.length === 0) throw new Error('phone root not found');
+  const audited: ButtonAudit[] = [];
+  for (const root of roots) {
+    const buttons = root.matches('button, [role="button"]')
+      ? [root, ...Array.from(root.querySelectorAll<HTMLElement>('button, [role="button"]'))]
+      : Array.from(root.querySelectorAll<HTMLElement>('button, [role="button"]'));
+    for (const el of buttons) {
+      const style = getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden') continue;
+      const rects = el.getClientRects();
+      if (rects.length === 0) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 1 || rect.height < 1) continue;
+      const text = (el.textContent ?? '').trim();
+      const glyphs = Array.from(el.querySelectorAll('svg')).map((svg) => {
+        const r = svg.getBoundingClientRect();
+        return { width: r.width, height: r.height };
+      });
+      audited.push({
+        label: text.slice(0, 24) || (glyphs.length ? '(glyph)' : '(empty)'),
+        className: el.getAttribute('class')?.slice(0, 48) ?? '',
+        font: parseFloat(style.fontSize),
+        width: rect.width,
+        height: rect.height,
+        clipped: el.scrollWidth > el.clientWidth + 1,
+        glyphs,
+      });
+    }
+  }
+  return audited;
+}
+
+function fontHistogram(buttons: ButtonAudit[]) {
+  const histogram: Record<string, number> = {};
+  for (const b of buttons) histogram[b.font] = (histogram[b.font] ?? 0) + 1;
+  return histogram;
+}
+
+async function auditPortrait(page: Page, info: TestInfo, stage: string) {
+  const buttons = await page.evaluate(auditScript);
+  console.log(`MOR-2816 portrait ${stage} histogram: ${JSON.stringify(fontHistogram(buttons))}`);
+  await info.attach(`portrait-${stage}-audit`, {
+    body: JSON.stringify(buttons, null, 2), contentType: 'application/json',
+  });
+  expect(buttons.length, `${stage}: buttons found`).toBeGreaterThan(0);
+  for (const b of buttons) {
+    const name = `${stage} "${b.label}" (${b.className})`;
+    expect.soft(b.font, `${name} font-size`).toBeGreaterThanOrEqual(16);
+    expect.soft(b.height, `${name} height`).toBeGreaterThanOrEqual(44);
+    expect.soft(b.clipped, `${name} clipped`).toBe(false);
+    // Glyph-only buttons: the glyph itself keeps the 16px floor.
+    if (!b.label || b.label === '(glyph)') {
+      for (const g of b.glyphs) {
+        expect.soft(g.width, `${name} glyph width`).toBeGreaterThanOrEqual(16);
+        expect.soft(g.height, `${name} glyph height`).toBeGreaterThanOrEqual(16);
+      }
+    }
   }
 }
 
+test('portrait buttons carry 16px labels and 44px touch targets (MOR-2816)', async ({ page }, info) => {
+  const writes = await prepare(page);
+  await page.setViewportSize({ width: 375, height: 812 });
+  await page.goto('/');
+  await settled(page);
+  await expect(page.locator('.m-layout')).toBeVisible();
+  // ESSENTIALS is the default active chip; audit it, then the RF chip panel.
+  await auditPortrait(page, info, 'essentials');
+  await page.getByRole('tab', { name: 'RF', exact: true }).click();
+  await expect(page.locator('#m-chip-panel-rf')).toBeVisible();
+  await auditPortrait(page, info, 'rf');
+  expect(writes).toEqual([]);
+});
+
+// MOR-2816 (owner ruling 2026-09-28): the 16px/44px floors made the scope
+// toolbar wrap into 4-5 rows and eat the panorama box. On the PORTRAIT phone
+// the toolbar is ONE row that scrolls horizontally, and the panorama
+// (spectrum + waterfall split region) keeps at least 190 CSS px at 375x812.
+test('portrait scope toolbar is one scrolling row over a 190px panorama (MOR-2816)', async ({ page }, info) => {
+  const writes = await prepare(page);
+  await page.setViewportSize({ width: 375, height: 812 });
+  await page.goto('/');
+  await settled(page);
+  await expect(page.locator('.m-layout')).toBeVisible();
+  const measured = await page.evaluate(() => {
+    const root = document.querySelector<HTMLElement>('.m-layout');
+    const toolbar = root?.querySelector<HTMLElement>('.spectrum-toolbar');
+    const panorama = root?.querySelector<HTMLElement>('.spectrum-split-region');
+    if (!root || !toolbar || !panorama) throw new Error('portrait scope surfaces not found');
+    const toolbarStyle = getComputedStyle(toolbar);
+    const buttons = Array.from(toolbar.querySelectorAll<HTMLElement>('button')).map((el) => {
+      const rect = el.getBoundingClientRect();
+      const fullyVisible = rect.left >= -1 && rect.right <= innerWidth + 1;
+      const reachableByScroll = toolbar.scrollWidth > toolbar.clientWidth + 1;
+      return { label: (el.textContent ?? '').trim().slice(0, 24), fullyVisible, reachableByScroll };
+    });
+    // The FAB mounts outside the .m-layout scroll root — query it directly.
+    const ptt = document.querySelector<HTMLElement>('.ptt-fab-label');
+    return {
+      toolbarHeight: toolbar.getBoundingClientRect().height,
+      toolbarOverflowX: toolbarStyle.overflowX,
+      toolbarWrap: toolbarStyle.flexWrap,
+      panoramaHeight: panorama.getBoundingClientRect().height,
+      buttons,
+      docScrollWidth: document.documentElement.scrollWidth,
+      innerWidth,
+      pttFont: ptt ? parseFloat(getComputedStyle(ptt).fontSize) : null,
+    };
+  });
+  writeFileSync(info.outputPath('mor-2816-toolbar.json'), JSON.stringify(measured, null, 2));
+  await info.attach('toolbar', { body: JSON.stringify(measured), contentType: 'application/json' });
+  // One button row: the 44px floor, at most 64px including padding.
+  expect(measured.toolbarHeight).toBeGreaterThanOrEqual(44);
+  expect(measured.toolbarHeight).toBeLessThanOrEqual(64);
+  expect(measured.toolbarWrap).toBe('nowrap');
+  expect(measured.toolbarOverflowX).toBe('auto');
+  // The panorama keeps its box: at least 190 CSS px of spectrum + waterfall.
+  expect(measured.panoramaHeight).toBeGreaterThanOrEqual(190);
+  // Every toolbar button is fully visible, or the toolbar scrolls to it.
+  for (const b of measured.buttons) {
+    expect.soft(b.fullyVisible || b.reachableByScroll, `toolbar button "${b.label}" reachable`).toBe(true);
+  }
+  // No page-level horizontal overflow.
+  expect(measured.docScrollWidth).toBeLessThanOrEqual(measured.innerWidth);
+  // The FAB's PTT label carries the 16px floor too.
+  expect(measured.pttFont).not.toBeNull();
+  expect(measured.pttFont!).toBeGreaterThanOrEqual(16);
+  expect(writes).toEqual([]);
+});
+
+// Landscape is MEASURED only (owner ruling: portrait-only change) — the
+// numbers are reported, nothing is asserted and nothing is changed there.
+test('landscape button label sizes measured, report only (MOR-2816)', async ({ page }, info) => {
+  await prepare(page);
+  await page.setViewportSize({ width: 812, height: 375 });
+  await page.goto('/');
+  await settled(page);
+  await expect(page.locator('.m-landscape')).toBeVisible();
+  const buttons = await page.evaluate(auditScript);
+  const measured = {
+    count: buttons.length,
+    histogram: fontHistogram(buttons),
+    heights: buttons.reduce<Record<string, number>>((acc, b) => {
+      acc[b.height] = (acc[b.height] ?? 0) + 1;
+      return acc;
+    }, {}),
+  };
+  console.log(`MOR-2816 landscape measured: ${JSON.stringify(measured)}`);
+  await info.attach('landscape-measured', {
+    body: JSON.stringify({ measured, buttons }, null, 2), contentType: 'application/json',
+  });
+  expect(measured.count).toBeGreaterThan(0);
+});
+
 for (const [width, height] of [[390, 844], [430, 932]]) {
-  test(`Unkey stays reachable through scrolling and rotation at ${width}x${height}`, async ({ page }, info) => {
+  test(`portrait shows no deck; landscape unkey stays reachable at ${width}x${height}`, async ({ page }, info) => {
     const writes = await prepare(page);
     await page.setViewportSize({ width, height });
     await page.goto('/');
     await settled(page);
-    await checkUnkey(page, info, 'focus-only', false, false);
-    await checkUnkey(page, info, 'portrait', false);
-    await page.locator('.m-content').evaluate((el) => { el.scrollTop = el.scrollHeight; });
-    await checkUnkey(page, info, 'scrolled', false);
+    await checkPortraitMinimal(page);
     await page.setViewportSize({ width: height, height: width });
     await expect(page.locator('.m-landscape')).toBeVisible();
-    await checkUnkey(page, info, 'landscape', true);
+    await checkLandscapeUnkey(page, info, 'landscape');
     await page.evaluate(async () => {
       if (document.fullscreenElement) await document.exitFullscreen();
     });
     await page.setViewportSize({ width, height });
     await expect(page.locator('.m-layout')).toBeVisible();
-    await checkUnkey(page, info, 'rotated-back', false);
+    await checkPortraitMinimal(page);
     const cdp = await page.context().newCDPSession(page);
     await cdp.send('Emulation.setSafeAreaInsetsOverride', { insets: { top: 44, bottom: 34 } });
     await expect(page.locator('.m-tuning-strip')).toHaveCSS('padding-bottom', '34px');
     await expect(page.locator('.m-tuning-strip')).toHaveCSS('height', '86px');
-    await checkUnkey(page, info, 'safe-area', false, false);
     expect(writes).toEqual([]);
   });
 }
