@@ -124,6 +124,13 @@
      */
     disabled?: boolean;
     /**
+     * MOR-1342: the unsliced single composition mounts one surface for every
+     * receiver, so the strip-level boolean above cannot name which receiver
+     * failed. A receiver the predicate marks unavailable gets the same select
+     * disable and the same reason; radio-wide controls stay live.
+     */
+    disabledForReceiver?: (receiver: ReceiverId) => boolean;
+    /**
      * MOR-2509 review — capability gates for the SPLIT / dual-watch keys,
      * read off the radio caps BY THE CALLER (this surface stays
      * capability-blind, the `hasDualReceiver` precedent). `false` renders
@@ -230,6 +237,7 @@
     showVfoList = true,
     groupLabel,
     disabled = false,
+    disabledForReceiver,
     hasSplit = true,
     hasDualWatch = true,
     hasDualReceiver = true,
@@ -288,9 +296,13 @@
    * this case) beats the MOR-1256 strip-level `disabled` prop (the receiver
    * itself is operationally unavailable).
    */
+  function receiverSelectDisabled(vfo: VfoViewModel): boolean {
+    return disabled || disabledForReceiver?.(vfo.receiver) === true;
+  }
+
   function selectReasonText(vfo: VfoViewModel): string | undefined {
     if (vfo.slot.kind === 'unknown') return t('core.vfo.select.unknownSlotReason');
-    if (disabled) return t('core.vfo.select.receiverUnavailableReason');
+    if (receiverSelectDisabled(vfo)) return t('core.vfo.select.receiverUnavailableReason');
     return undefined;
   }
 
@@ -514,7 +526,7 @@
   }
 
   function selectVfo(vfo: VfoViewModel): void {
-    if (!isSelectable(vfo) || vfo.slot.kind === 'unknown' || disabled) return;
+    if (!isSelectable(vfo) || vfo.slot.kind === 'unknown' || receiverSelectDisabled(vfo)) return;
     onSelectVfo?.({ receiver: vfo.receiver, slot: vfo.slot });
   }
 
@@ -798,7 +810,7 @@
 
   {#snippet vfoTile(vfo: VfoViewModel, i: number)}
       {@const selectable = isSelectable(vfo)}
-      {@const selectDisabled = selectable && (vfo.slot.kind === 'unknown' || disabled)}
+      {@const selectDisabled = selectable && (vfo.slot.kind === 'unknown' || receiverSelectDisabled(vfo))}
       {@const freq = frequencyDisplay(vfo)}
       {@const pendingHz = pendingFrequencyHz?.[vfo.receiver] ?? null}
       {@const displayHz = observationValue(vfo.display?.frequencyHz, vfo.frequencyHz)}
