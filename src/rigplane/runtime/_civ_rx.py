@@ -667,7 +667,7 @@ _CTL_MEM_VOX_DELAY_PREFIXES = (
 
 # CI-V data watchdog (wfview icomudpcivdata::watchdog)
 # If no CI-V data for this long, send open_close to restart the stream.
-_CIV_DATA_WATCHDOG_TIMEOUT = 2.0  # seconds (wfview: 2000ms)
+_CIV_DATA_WATCHDOG_TIMEOUT = 5.0  # seconds (wfview: 2000ms)
 _CIV_DATA_WATCHDOG_RETRY = 0.1  # retry interval (wfview: 100ms via startCivDataTimer)
 # Patient OpenClose before handing a live-but-unanswered port to lifecycle
 # recovery. A port that has gone completely silent gives up much sooner.
