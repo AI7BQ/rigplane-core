@@ -439,7 +439,7 @@ def _print_common_cli_hint(argv: list[str]) -> None:
             "'web' can discover the radio's IP, but the model must be named; "
             "you can also pass the radio explicitly:\n"
             "  rigplane --model IC-7610 web\n"
-            "  rigplane --model IC-7610 web --radio-host 192.168.55.40 "
+            "  rigplane --model IC-7610 web --radio-host 192.168.1.50 "
             "--radio-user USER --radio-pass-file /path/to/password\n",
             file=sys.stderr,
         )
@@ -448,10 +448,10 @@ def _print_common_cli_hint(argv: list[str]) -> None:
     if _has_global_connection_options_after_command(argv):
         print(
             "\nHint: radio connection options normally go before the command:\n"
-            "  rigplane --model IC-7610 --backend lan --host 192.168.55.40 "
+            "  rigplane --model IC-7610 --backend lan --host 192.168.1.50 "
             "--user USER --pass-file /path/to/password web\n\n"
             "For the web UI, the more readable form is also supported:\n"
-            "  rigplane --model IC-7610 web --radio-host 192.168.55.40 "
+            "  rigplane --model IC-7610 web --radio-host 192.168.1.50 "
             "--radio-user USER --radio-pass-file /path/to/password\n",
             file=sys.stderr,
         )
@@ -463,6 +463,41 @@ def _looks_like_explicit_radio_ip(value: str) -> bool:
     except ValueError:
         return False
     return not (address.is_loopback or address.is_unspecified)
+
+
+def _resolve_deprecated_listen_host(args: argparse.Namespace) -> None:
+    """Fold the deprecated subcommand --host into --listen (MOR-2954).
+
+    web/serve/station take --listen for the listen address; their --host
+    stays as a deprecated alias that warns once on stderr. --listen wins
+    when both are given, regardless of order — hence separate argparse
+    dests resolved here rather than one shared dest (which would be
+    last-flag-wins).
+    """
+    command = getattr(args, "command", None)
+    if command in ("web", "station"):
+        primary, legacy = "web_host", "web_host_legacy"
+    elif command == "serve":
+        primary, legacy = "serve_host", "serve_host_legacy"
+    else:
+        return
+    if hasattr(args, legacy):
+        legacy_value = getattr(args, legacy)
+        delattr(args, legacy)
+        if hasattr(args, primary):
+            print(
+                "Warning: --host is deprecated, use --listen instead "
+                "(both given; --listen wins)",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "Warning: --host is deprecated, use --listen instead",
+                file=sys.stderr,
+            )
+            setattr(args, primary, legacy_value)
+    elif not hasattr(args, primary):
+        setattr(args, primary, "0.0.0.0")
 
 
 def _warn_web_host_ambiguity(args: argparse.Namespace) -> None:
@@ -499,6 +534,7 @@ class _RigplaneArgumentParser(argparse.ArgumentParser):
                 _print_common_cli_hint(argv)
             raise
         parsed._explicit_control_port = _has_explicit_radio_control_port(argv)  # noqa: SLF001
+        _resolve_deprecated_listen_host(parsed)
         _apply_managed_runtime_defaults(parsed)
         _warn_web_host_ambiguity(parsed)
         return parsed
@@ -587,7 +623,7 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog=(
             "examples:\n"
             "  rigplane --model IC-7610 web                    # discover radio IP, start web UI\n"
-            "  rigplane --model IC-7610 web --radio-host 192.168.55.40  # explicit radio IP\n"
+            "  rigplane --model IC-7610 web --radio-host 192.168.1.50  # explicit radio IP\n"
             "  rigplane --model IC-7610 web --preset digimode  # bridge + rigctld + WSJT-X compat\n"
             "  rigplane --model IC-7610 web --bridge           # web UI + audio bridge\n"
             "  rigplane --model IC-7610 serve                  # rigctld server only\n"
@@ -1171,10 +1207,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"Apply a named preset ({', '.join(_PRESETS)}). User flags override preset values.",
     )
     serve_p.add_argument(
-        "--host",
+        "--listen",
         dest="serve_host",
-        default="0.0.0.0",
-        help="Server listen address (default: 0.0.0.0)",
+        default=argparse.SUPPRESS,
+        help="Listen address (default: 0.0.0.0)",
+    )
+    serve_p.add_argument(
+        "--host",
+        dest="serve_host_legacy",
+        default=argparse.SUPPRESS,
+        metavar="HOST",
+        help="Deprecated: use --listen instead",
     )
     serve_p.add_argument(
         "--port",
@@ -1292,10 +1335,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Radio backend type for the web UI backend",
     )
     web_p.add_argument(
-        "--host",
+        "--listen",
         dest="web_host",
-        default="0.0.0.0",
-        help="Server listen address (default: 0.0.0.0)",
+        default=argparse.SUPPRESS,
+        help="Listen address (default: 0.0.0.0)",
+    )
+    web_p.add_argument(
+        "--host",
+        dest="web_host_legacy",
+        default=argparse.SUPPRESS,
+        metavar="HOST",
+        help="Deprecated: use --listen instead",
     )
     web_p.add_argument(
         "--managed",
@@ -1476,10 +1526,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Start managed local station runtime (loopback web server)",
     )
     station_p.add_argument(
-        "--host",
+        "--listen",
         dest="web_host",
-        default="0.0.0.0",
-        help="Server listen address (managed default: 127.0.0.1)",
+        default=argparse.SUPPRESS,
+        help="Listen address (managed default: 127.0.0.1)",
+    )
+    station_p.add_argument(
+        "--host",
+        dest="web_host_legacy",
+        default=argparse.SUPPRESS,
+        metavar="HOST",
+        help="Deprecated: use --listen instead",
     )
     station_p.add_argument(
         "--port",
@@ -1555,7 +1612,7 @@ def _build_parser() -> argparse.ArgumentParser:
     proxy_p.add_argument(
         "--radio",
         required=True,
-        help="Radio IP address (e.g. 192.168.55.40)",
+        help="Radio IP address (e.g. 192.168.1.50)",
     )
     proxy_p.add_argument(
         "--listen",
