@@ -2550,7 +2550,13 @@ async def _served_through_cli(radio: object) -> AsyncIterator[WebServer]:
     served: list[WebServer] = []
     release = asyncio.Event()
 
-    async def _serve_forever(self: WebServer, *, on_started: object = None) -> None:
+    async def _serve_forever(
+        self: WebServer,
+        *,
+        on_started: object = None,
+        on_shutdown_signal: object = None,
+        on_tx_release: object = None,
+    ) -> None:
         await self.start()
         served.append(self)
         await release.wait()

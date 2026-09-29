@@ -112,7 +112,13 @@ from rigplane.core.radio_protocol import (  # noqa: E402
 from rigplane.core.tx_safety import TxOutcome, TxOwner, TxSource  # noqa: E402
 from rigplane.core.types import Mode, get_audio_capabilities  # noqa: E402
 from rigplane.profiles import resolve_radio_profile  # noqa: E402
+from rigplane.runtime.managed_tx_authority import (  # noqa: E402
+    ATTEMPT_TIMEOUT_S,
+    RETRY_DELAY_S,
+    ShutdownResult,
+)
 from rigplane.runtime.managed_tx_effect_lane import ManagedTxActuator  # noqa: E402
+from rigplane.runtime.managed_tx_state import ActuationOperation  # noqa: E402
 from rigplane.runtime.managed_tx_composition import (  # noqa: E402
     ManagedTxComposition,
     ManagedTxCompositionPort,
@@ -1982,16 +1988,175 @@ async def _cmd_list_audio_devices(args: argparse.Namespace) -> int:
     return 0
 
 
+# MOR-2875: _ShutdownBackstop's bound on a `web`/`station` shutdown after its
+# first SIGTERM/SIGINT is _first_signal_shutdown_bound_s(): the timed waits of
+# the shutdown's steps plus a margin.
+_MANAGED_TX_SHUTDOWN_DRAIN_S: float = ATTEMPT_TIMEOUT_S
+_MANAGED_TX_SHUTDOWN_SETTLE_S: float = ATTEMPT_TIMEOUT_S + RETRY_DELAY_S
+_MANAGED_TX_SHUTDOWN_S: float = (
+    _MANAGED_TX_SHUTDOWN_DRAIN_S + _MANAGED_TX_SHUTDOWN_SETTLE_S
+)
+_SHUTDOWN_MARGIN_S: float = 2.0
+_SHUTDOWN_FORCED_EXIT_GRACE_S: float = 3.0
+
+
+def _first_signal_shutdown_bound_s() -> float:
+    from rigplane.backends._icom_serial_base import _IcomSerialRadioBase
+    from rigplane.rigctld.server import STOP_TIMEOUT_S as RIGCTLD_STOP_TIMEOUT_S
+    from rigplane.web.web_startup import WEB_STOP_TIMEOUT_S
+
+    # radio.__aexit__: the serial Icom disconnect's watchdog teardown.
+    radio_exit_s: float = _IcomSerialRadioBase._SERIAL_CIV_WATCHDOG_TEARDOWN_TIMEOUT_S
+    return (
+        WEB_STOP_TIMEOUT_S
+        + RIGCTLD_STOP_TIMEOUT_S
+        + _MANAGED_TX_SHUTDOWN_S
+        + radio_exit_s
+        + _SHUTDOWN_MARGIN_S
+    )
+
+
+def _describe_pending_task(task: asyncio.Task[Any]) -> str:
+    """A pending task's name and the await chain it is suspended in."""
+    frames: list[str] = []
+    awaited: Any = task.get_coro()
+    while (frame := getattr(awaited, "cr_frame", None)) is not None:
+        code = frame.f_code
+        frames.append(
+            f"{Path(code.co_filename).name}:{frame.f_lineno} {code.co_qualname}"
+        )
+        awaited = getattr(awaited, "cr_await", None)
+    return f"{task.get_name()}: {' -> '.join(frames)}"
+
+
+class _ShutdownBackstop:
+    """End a `web`/`station` shutdown that overruns its bound (MOR-2875).
+
+    ``arm`` (the first SIGTERM/SIGINT) starts the clock. At the bound, if the
+    shutdown task is still running, every pending task but the backstop's
+    own is logged by name and await chain, and the shutdown task is
+    cancelled; if it is still running a grace period later, the process
+    exits. Neither step is taken while a task passed to ``protect`` is
+    running inside its own bound. ``disarm`` stops the clock.
+    """
+
+    def __init__(self, shutdown_task: asyncio.Task[Any], bound_s: float) -> None:
+        self._shutdown_task = shutdown_task
+        self._bound_s = bound_s
+        self._releases: list[tuple[asyncio.Future[Any], str, float]] = []
+        self._clock: asyncio.Task[None] | None = None
+
+    def arm(self) -> None:
+        if self._clock is None:
+            self._clock = asyncio.get_running_loop().create_task(
+                self._enforce(), name="shutdown-backstop"
+            )
+
+    def disarm(self) -> None:
+        if self._clock is not None:
+            self._clock.cancel()
+
+    def protect(self, release: asyncio.Future[Any], what: str, bound_s: float) -> None:
+        deadline = asyncio.get_running_loop().time() + bound_s
+        self._releases.append((release, what, deadline))
+
+    async def _let_releases_finish(self) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            now = loop.time()
+            live = [(r, w, d) for r, w, d in self._releases if not r.done() and d > now]
+            if not live:
+                return
+            deadline = max(d for _r, _w, d in live)
+            logger.warning(
+                "shutdown bound: letting %s finish, up to %.1fs",
+                ", ".join(w for _r, w, _d in live),
+                deadline - now,
+            )
+            await asyncio.wait([r for r, _w, _d in live], timeout=deadline - now)
+
+    async def _enforce(self) -> None:
+        await asyncio.sleep(self._bound_s)
+        await self._let_releases_finish()
+        if self._shutdown_task.done():
+            return
+        me = asyncio.current_task()
+        logger.error(
+            "shutdown still running %.1fs after the first signal; cancelling it."
+            " Pending tasks:\n%s",
+            self._bound_s,
+            "\n".join(
+                _describe_pending_task(task)
+                for task in asyncio.all_tasks()
+                if task is not me
+            ),
+        )
+        self._shutdown_task.cancel()
+        await asyncio.sleep(_SHUTDOWN_FORCED_EXIT_GRACE_S)
+        await self._let_releases_finish()
+        if self._shutdown_task.done():
+            return
+        logger.error(
+            "shutdown still running %.1fs after it was cancelled; forced exit",
+            _SHUTDOWN_FORCED_EXIT_GRACE_S,
+        )
+        os._exit(130)
+
+
+def _unconfirmed_unkey(
+    composition: ManagedTxCompositionPort, session: str | None
+) -> str:
+    """The session, provider generation and release attempt a managed-TX
+    shutdown left unconfirmed, for its ERROR line (MOR-2875)."""
+    projection = composition.authority.snapshot_nowait()
+    effect = projection.state.pending_effect
+    last = projection.state.last_actuation
+    generation = projection.provider_generation
+    if effect is not None:
+        generation = effect.token.provider_generation
+        attempt = f"attempt {effect.token.attempt_id} {effect.operation} unanswered"
+    elif last is not None and last.operation is ActuationOperation.FORCE_RECEIVE:
+        attempt = f"attempt {last.attempt_id} {last.operation} {last.result}"
+    else:
+        attempt = "no release attempt"
+    error = projection.state.last_error
+    return (
+        f"session {session or 'none'}, provider generation {generation}, {attempt}"
+        + ("" if error is None else f" ({error})")
+    )
+
+
 async def _shutdown_managed_tx_composition(
     composition: ManagedTxCompositionPort,
 ) -> None:
+    session = composition.authority.snapshot_nowait().state.intent.owner_token
     termination = asyncio.Event()
     shutdown = asyncio.create_task(composition.shutdown(termination))
     try:
-        await asyncio.wait_for(asyncio.shield(shutdown), timeout=3.0)
+        result = await asyncio.wait_for(
+            asyncio.shield(shutdown), timeout=_MANAGED_TX_SHUTDOWN_DRAIN_S
+        )
     except TimeoutError:
         termination.set()
-        await asyncio.shield(shutdown)
+        try:
+            result = await asyncio.wait_for(
+                asyncio.shield(shutdown), timeout=_MANAGED_TX_SHUTDOWN_SETTLE_S
+            )
+        except TimeoutError:
+            logger.error(
+                "managed TX shutdown: unkey not confirmed, the rig may still be"
+                " keyed: %s; still running %.1fs after it was terminated",
+                _unconfirmed_unkey(composition, session),
+                _MANAGED_TX_SHUTDOWN_SETTLE_S,
+            )
+            return
+    if result is ShutdownResult.TERMINATED:
+        logger.error(
+            "managed TX shutdown: unkey not confirmed within %.1fs, the rig may"
+            " still be keyed: %s",
+            _MANAGED_TX_SHUTDOWN_DRAIN_S,
+            _unconfirmed_unkey(composition, session),
+        )
 
 
 class _ManagedTxRadioSession:
@@ -1999,9 +2164,11 @@ class _ManagedTxRadioSession:
         self,
         radio: Any,
         composition: ManagedTxCompositionPort,
+        backstop: _ShutdownBackstop | None = None,
     ) -> None:
         self._radio = radio
         self._composition = composition
+        self._backstop = backstop
         self._shutdown_task: asyncio.Task[None] | None = None
 
     async def __aenter__(self) -> Any:
@@ -2029,6 +2196,10 @@ class _ManagedTxRadioSession:
                 _shutdown_managed_tx_composition(self._composition)
             )
             self._shutdown_task = task
+            if self._backstop is not None:
+                self._backstop.protect(
+                    task, "managed TX shutdown", _MANAGED_TX_SHUTDOWN_S
+                )
         await asyncio.shield(task)
 
     async def __aexit__(self, *exc: object) -> bool:
@@ -2119,10 +2290,14 @@ async def _run(args: argparse.Namespace) -> int:
             print(f"Error: managed TX composition unavailable: {exc}", file=sys.stderr)
             return 1
 
+    backstop: _ShutdownBackstop | None = None
+    shutdown_task = asyncio.current_task()
+    if args.command in ("web", "station") and shutdown_task is not None:
+        backstop = _ShutdownBackstop(shutdown_task, _first_signal_shutdown_bound_s())
     session = (
         radio
         if managed_tx_composition is None
-        else _ManagedTxRadioSession(radio, managed_tx_composition)
+        else _ManagedTxRadioSession(radio, managed_tx_composition, backstop)
     )
     try:
         async with session:
@@ -2236,6 +2411,7 @@ async def _run(args: argparse.Namespace) -> int:
                     radio,
                     args,
                     managed_tx_composition=managed_tx_composition,
+                    shutdown_backstop=backstop,
                 )
             elif args.command == "scope":
                 return await _cmd_scope(radio, args)
@@ -2281,6 +2457,8 @@ async def _run(args: argparse.Namespace) -> int:
     finally:
         if isinstance(session, _ManagedTxRadioSession):
             await session.shutdown()
+        if backstop is not None:
+            backstop.disarm()
 
 
 def _audio_frame_bytes(
@@ -3857,6 +4035,7 @@ async def _cmd_web(
     args: argparse.Namespace,
     *,
     managed_tx_composition: ManagedTxCompositionPort | None = None,
+    shutdown_backstop: _ShutdownBackstop | None = None,
 ) -> int:
     import pathlib
 
@@ -4119,12 +4298,24 @@ async def _cmd_web(
         )
 
     try:
-        await server.serve_forever(on_started=_banner)
+        if shutdown_backstop is None:
+            await server.serve_forever(on_started=_banner)
+        else:
+            await server.serve_forever(
+                on_started=_banner,
+                on_shutdown_signal=shutdown_backstop.arm,
+                on_tx_release=shutdown_backstop.protect,
+            )
     except asyncio.CancelledError:
         pass
     finally:
         if rigctld_server is not None:
-            await rigctld_server.stop()
+            from rigplane.rigctld.server import STOP_TIMEOUT_S
+
+            stop = asyncio.ensure_future(rigctld_server.stop())
+            if shutdown_backstop is not None:
+                shutdown_backstop.protect(stop, "rigctld stop", STOP_TIMEOUT_S)
+            await stop
     return 0
 
 
@@ -4414,7 +4605,9 @@ def main() -> None:
             loop = asyncio.new_event_loop()
             try:
                 exit_code = loop.run_until_complete(_run(args))
-            except KeyboardInterrupt:
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                # MOR-2875: a cancelled shutdown ends with the signal exit
+                # code, not a CancelledError traceback.
                 exit_code = 130
             finally:
                 signal.signal(signal.SIGTERM, signal.SIG_IGN)
