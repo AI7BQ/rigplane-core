@@ -126,22 +126,28 @@ def test_ic705_polls_the_type_through_16_5d() -> None:
 # ── Neutral rule ─────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize(
-    ("kind", "pair"),
-    [
-        (ToneSquelchType.OFF, (False, False)),
-        (ToneSquelchType.TONE, (True, False)),
-        (ToneSquelchType.TSQL, (True, True)),
-        (ToneSquelchType.DTCS, (None, None)),
-        (ToneSquelchType.DTCS_T, (None, None)),
-        (ToneSquelchType.TONE_T_DTCS_R, (None, None)),
-        (ToneSquelchType.DTCS_T_TSQL_R, (None, None)),
-        (ToneSquelchType.TONE_T_TSQL_R, (None, None)),
-        (None, (None, None)),
-    ],
-)
+_NEUTRAL_RULE_CASES = [
+    (ToneSquelchType.OFF, (False, False)),
+    (ToneSquelchType.TONE, (True, False)),
+    (ToneSquelchType.TSQL, (True, True)),
+    (ToneSquelchType.DTCS, (None, None)),
+    (ToneSquelchType.DTCS_T, (None, None)),
+    (ToneSquelchType.TONE_T_DTCS_R, (None, None)),
+    (ToneSquelchType.DTCS_T_TSQL_R, (None, None)),
+    (ToneSquelchType.TONE_T_TSQL_R, (None, None)),
+    (ToneSquelchType.PR_FREQ, (None, None)),
+    (ToneSquelchType.REV_TONE, (None, None)),
+    (None, (None, None)),
+]
+
+
+@pytest.mark.parametrize(("kind", "pair"), _NEUTRAL_RULE_CASES)
 def test_ctcss_booleans_for_each_type(kind, pair) -> None:
     assert ctcss_booleans_for_tone_squelch_type(kind) == pair
+
+
+def test_the_neutral_rule_cases_cover_every_type() -> None:
+    assert {kind for kind, _ in _NEUTRAL_RULE_CASES} == {*ToneSquelchType, None}
 
 
 # ── Loader ───────────────────────────────────────────────────────────
@@ -178,6 +184,20 @@ def test_selector_without_a_table_refuses_to_load(tmp_path, selector) -> None:
 def test_an_absent_selector_needs_no_table(tmp_path) -> None:
     path = _write_toml(tmp_path, _toml(selector="absent", table=None))
     assert load_rig(path).to_profile().tone_squelch_types is None
+
+
+# The FTX-1's selector is its CAT CT read (rigs/ftx1.toml, MOR-2969).
+_CAT_SQL_TYPE_READ = (
+    'get_sql_type = { cat = { read = "CT{receiver};", parse = "CT{receiver}{type};" } }'
+)
+
+
+def test_a_cat_sql_type_read_without_a_table_refuses_to_load(tmp_path) -> None:
+    text = _MINIMAL_TOML.replace(
+        "[commands.overrides]", f"{_CAT_SQL_TYPE_READ}\n\n[commands.overrides]"
+    )
+    with pytest.raises(RigLoadError, match="get_sql_type needs a"):
+        load_rig(_write_toml(tmp_path, text))
 
 
 @pytest.mark.parametrize(
