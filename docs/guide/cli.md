@@ -21,9 +21,9 @@ All commands accept these options:
 | `--pass-file` | — | — | Read the password from the first line of a file |
 | `--timeout` | — | `5.0` | Timeout in seconds |
 | `--json` | — | `false` | Emit JSON when supported by the selected command |
-| `--backend` | — | auto | Backend type: `lan`, `serial`, `yaesu-cat`, or `rigctld`. Auto-inferred from `--serial-port` if set. |
-| `--serial-port` | `ICOM_SERIAL_DEVICE` | auto-discover | Serial device path. If omitted with `--backend serial`, discovers via USB scan. |
-| `--serial-baud` | `ICOM_SERIAL_BAUDRATE` | env or backend default | Serial baud (`115200` for `serial`, `38400` for `yaesu-cat` when env is unset) |
+| `--backend` | — | from the model | Backend type: `lan`, `serial`, `yaesu-cat`, or `rigctld`. When omitted it follows the model's profile: a CI-V radio uses `serial` with `--serial-port` and `lan` without it; the FTX-1 uses `yaesu-cat`; a profile with another protocol is refused. Without `--model`: `serial` with `--serial-port`, else `lan`. `rigctld` must be named. |
+| `--serial-port` | `ICOM_SERIAL_DEVICE` | auto-discover | Serial device path. If omitted with the `serial` or `yaesu-cat` backend, discovers via USB scan. |
+| `--serial-baud` | `ICOM_SERIAL_BAUDRATE` | env or backend default | Serial baud. When the env var is unset, a port found by the USB scan keeps the rate the scan found; with `--serial-port`, `serial` uses the model profile's `default_baud` (`115200` without a model) and `yaesu-cat` uses `38400` |
 | `--serial-ptt-mode` | `ICOM_SERIAL_PTT_MODE` | `civ` | Serial PTT mode (`civ` currently supported) |
 | `--rx-device` | `ICOM_USB_RX_DEVICE` | auto | USB audio RX device name (serial/CAT profiles with audio support) |
 | `--tx-device` | `ICOM_USB_TX_DEVICE` | auto | USB audio TX device name (serial/CAT profiles with audio support) |
@@ -57,11 +57,14 @@ LAN discovery finds the radio's IP address but not its model, so name the model 
 
 Similarly, when `--backend serial` is set without `--serial-port`, serial ports are scanned automatically.
 
-The `--backend` flag is auto-inferred:
+When `--backend` is omitted, it is inferred. A serial port counts as given
+when `--serial-port` or `ICOM_SERIAL_DEVICE` is set.
 
-- `--serial-port` provided → infers `--backend serial`
-- `ICOM_SERIAL_DEVICE` set → infers `--backend serial`
-- Otherwise → `lan` (default)
+- With `--model`, from the model's profile: a CI-V radio gets `serial` when a
+  serial port is given and `lan` otherwise; the FTX-1 gets `yaesu-cat`; a
+  profile with another protocol is refused.
+- Without `--model`: `serial` when a serial port is given, `lan` otherwise.
+- `rigctld` is never inferred.
 
 ## Presets
 
@@ -82,11 +85,15 @@ User-provided flags override preset values: `--preset digimode --bridge "MyDevic
 
 ## Backend Selection
 
-rigplane supports four backends: **LAN** (default), **serial** (USB CI-V),
+rigplane supports four backends: **LAN**, **serial** (USB CI-V),
 **yaesu-cat** (text CAT over serial), and **rigctld** (external Hamlib
 `rigctld` over TCP).
 
-### LAN backend (default)
+Without `--backend`, the backend follows the model's profile, as the
+`--backend` option above describes; for a CI-V radio without `--serial-port`
+that is LAN.
+
+### LAN backend
 
 ```bash
 # Auto-discover radio on LAN
@@ -117,9 +124,9 @@ rigplane --model IC-7610 status    # auto-infers --backend serial
 ### Yaesu CAT backend
 
 ```bash
-# Connects via Yaesu CAT serial protocol (for example the FTX-1)
-rigplane --backend yaesu-cat --serial-port /dev/tty.usbserial-FTX1 status
-rigplane --backend yaesu-cat --serial-port /dev/tty.usbserial-FTX1 freq
+# The FTX-1 profile selects the Yaesu CAT backend (--backend yaesu-cat does the same)
+rigplane --model FTX-1 --serial-port /dev/tty.usbserial-FTX1 status
+rigplane --model FTX-1 --serial-port /dev/tty.usbserial-FTX1 freq
 ```
 
 ### External rigctld backend
@@ -139,10 +146,11 @@ This provider-facing endpoint is separate from RigPlane's own client-facing
 
 ### Serial baud defaults by backend
 
-If `--serial-baud` and `ICOM_SERIAL_BAUDRATE` are both unset:
+If `--serial-baud` and `ICOM_SERIAL_BAUDRATE` are both unset, a port found by
+the USB scan keeps the rate the scan found. With `--serial-port`:
 
-- `--backend serial` defaults to `115200`
-- `--backend yaesu-cat` defaults to `38400`
+- `serial` uses the model profile's `default_baud`, or `115200` without a model
+- `yaesu-cat` uses `38400`
 
 ### Audio device selection (serial backend)
 
