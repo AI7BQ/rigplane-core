@@ -29,10 +29,8 @@ that class of defect is release-blocking by definition and is not on this list.
 - **PBT values across acquisition gaps: the last confirmed value is kept in
   software, but the owner-present IC-7300 observation is still pending.**
   (MOR-1692)
-- **Combined RF/SQL control does not track the gesture locally.** Values update
-  only after canonical radio readback (~1 s), which makes precise placement
-  awkward; the SDR-screen skin's rendering of the same control tracks
-  correctly. (MOR-1693)
+- **The combined RF/SQL control follows the gesture in software, but
+  the owner-present IC-7300 rerun is still pending.** (MOR-1693)
 - **Filter Shape and grouped Notch choices show pending feedback in software,
   but the owner-present IC-7300 rerun is still pending.** (MOR-1689)
 - **IC-7300 has no APF.** Advanced Manual (11a) omits `16 32`, and a
@@ -45,10 +43,6 @@ that class of defect is release-blocking by definition and is not on this list.
 - **Manual-notch position on the FTX-1 is shown as a position, not in Hz.**
   The radio's own display does the same; the CAT code range is bounded to
   001..320 since #3480/#3526. (MOR-1680, owner ruling 2026-09-17)
-- **IF Shift, CW Pitch and NR level on the FTX-1 follow the CAT lattices in
-  software (20 Hz, 10 Hz to 1050 Hz, 0–10) but have not been re-run on the
-  radio since the change.** (MOR-1681, MOR-1682, MOR-1678 — hardware rerun
-  pending)
 - **Attenuator and preamp cannot be set for the SUB receiver.** The FTX-1 CAT
   `RA`/`PA` commands have no SUB form; the controls are shown disabled with
   the hint "Not available on this receiver" while SUB is active. (MOR-2511,
@@ -90,14 +84,43 @@ that class of defect is release-blocking by definition and is not on this list.
   advanced tooling, not part of the frequency/mode/PTT command flow a
   logging or digital-mode client uses for normal operation. (MOR-1882)
 
+## Hardware validation
+
+- **The radios validated on 3.0 hardware are the IC-7300 over USB, the
+  FTX-1 over USB and the IC-7610 over LAN.** The IC-7610 was validated on
+  3.0 builds up to 2026-09-27; later changes were not re-run on it. Not
+  validated on 3.0 hardware: the IC-705, the IC-9700, the X6200 and the
+  X6100. For the IC-9700, one reporter tested the POWER ON fix of #3862
+  over LAN.
+
 ## Dual-receiver topology
 
-**Dual-receiver hardware certification is not part of this beta.** The bench
-holds an IC-7610 (returned 2026-09-14) and an FTX-1; the IC-7610's dual-watch,
-dual-scope and simultaneous MAIN/SUB audio-routing paths were not re-run for
-this beta and remain covered by automated profile fixtures and fail-closed
-tests only. What was accepted on hardware: single-receive SUB operation on the
-FTX-1 — frequency, mode, width, S-meter, AF/RF/squelch, repeater shift, NB/NR,
-notch, IF shift, NARROW and AGC read from the SUB receiver, and AGC and NB
-writes measured landing on SUB with MAIN unchanged (MOR-2511, 2026-09-18). Do
+**Dual-receiver hardware certification is not part of this beta.** The
+IC-7610's dual-watch, dual-scope and simultaneous MAIN/SUB audio-routing
+paths were not re-run for this beta and remain covered by automated
+profile fixtures and fail-closed tests only. What was accepted on
+hardware: single-receive SUB operation on the FTX-1 — frequency, mode,
+width, S-meter, AF/RF/squelch, repeater shift, NB/NR, notch, IF shift,
+NARROW and AGC read from the SUB receiver, and AGC and NB writes
+measured landing on SUB with MAIN unchanged (MOR-2511, 2026-09-18). Do
 not treat any other dual-receiver path as hardware-certified.
+
+## Command acknowledgement
+
+- **A write the radio refuses can still answer `ok` to the caller.** The
+  refusal shows only in the server log. (MOR-3004)
+
+## Web UI
+
+- **On a phone, the panorama's frequency labels overlap at its two
+  edges.** (MOR-3011)
+- **The LCD skin's VFO control panel shows the A↔B and A=B keys without
+  checking whether the radio's VFO scheme supports them.** (MOR-2912)
+
+## Command-line output
+
+- **CLI output is lost when standard output is a pipe.** The CLI ends its
+  radio commands with `os._exit`, which skips the flush of block-buffered
+  stdout, so a command that prints — `status`, `freq`, `mode`, `meter` —
+  exits 0 with empty output when piped; on a terminal stdout is
+  line-buffered and nothing is lost. (MOR-3010)
