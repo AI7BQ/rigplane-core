@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from collections.abc import (
     AsyncIterator,
     Callable,
@@ -70,6 +71,7 @@ from rigplane.web.web_startup import (
     _await_initial_state_acquisition,
     _observed_paths,
 )
+from test_icom7610_serial_radio import _FakeSerialCivLink
 
 FREQ = FieldPath.active("main", "freq_mode", "freq_hz")
 MODE = FieldPath.active("main", "freq_mode", "mode")
@@ -2527,6 +2529,16 @@ def _fast_retry_serial_radio(device: str, link: object) -> _IcomSerialRadioBase:
     radio._SERIAL_WATCHDOG_INTERVAL_S = 0.005
     radio._SERIAL_WATCHDOG_RETRY_S = 0.005
     radio._SERIAL_WATCHDOG_RETRY_MAX_S = 0.01
+    # MOR-3078: the identity re-read ladder runs on the same compressed
+    # clock (the MOR-3071 ``_gate_radio`` fixture compresses both). This
+    # fixture predates the identity gate: left at the production
+    # 1/2/4/8/15 s ladder, any gate miss rides that ladder past the
+    # suite's bounded 5 s budgets. The Linux quick failure's original
+    # cause is still unknown; this only puts the ladder on the fixture
+    # clock. The answer window (``_civ_get_timeout``) stays at its
+    # production width.
+    radio._SERIAL_IDENTITY_REREAD_BACKOFF_S = (0.05, 0.1, 0.2, 0.4)
+    radio._SERIAL_IDENTITY_REREAD_STEADY_S = 0.5
     # The fake link answers no poll: once the port opens, the watchdog would
     # declare link-down on that silence, parking transmit and reopening the
     # port under the assertions at a moment that depends on runner load.
@@ -2534,9 +2546,144 @@ def _fast_retry_serial_radio(device: str, link: object) -> _IcomSerialRadioBase:
     return radio
 
 
+# ---------------------------------------------------------------------------
+# MOR-3078 diagnostic: a transparent test-local witness around the fake
+# CI-V link, so a failed missing-port assertion can show what happened to
+# the ``19 00`` answer. The original Linux quick failure is NOT reproduced
+# or explained by this code; it only records evidence at the moment of a
+# failure. No production behavior, clock, or response generation changes.
+# ---------------------------------------------------------------------------
+
+
+def _diag_task_id(task: object) -> str:
+    if task is None:
+        return "None"
+    done = "done" if task.done() else "live"  # type: ignore[attr-defined]
+    return f"{id(task):x}/{task.get_name()}/{done}"  # type: ignore[attr-defined]
+
+
+def _diag_gate_state(radio: object) -> str:
+    """One compact line of the identity-gate state at an event."""
+
+    if radio is None:
+        return "radio=unbound"
+    conn_state = getattr(radio, "_conn_state", None)
+    identity = getattr(radio, "connection_identity", None)
+    status = getattr(identity, "status", None)
+    last_error = getattr(radio, "last_error", None)
+    return (
+        f"radio[conn={getattr(conn_state, 'name', conn_state)} "
+        f"connected={getattr(radio, 'connected', None)} "
+        f"stream_ready={getattr(radio, '_civ_stream_ready', None)} "
+        f"epoch={getattr(radio, '_civ_epoch', None)} "
+        f"rx_src={getattr(radio, '_active_rx_source_generation', None)} "
+        f"ans_epoch={getattr(radio, '_serial_identity_answer_epoch', None)} "
+        f"identity={getattr(status, 'name', status)} "
+        f"reread={_diag_task_id(getattr(radio, '_serial_identity_reread_task', None))} "
+        f"err={str(last_error)[-48:]!r}]"
+    )
+
+
+class _TracedCivLink(_FakeSerialCivLink):
+    """Transparent witness around ``_FakeSerialCivLink`` (MOR-3078).
+
+    Records a bounded (max 100, most recent) monotonic-timestamped trace
+    of link events — connect/disconnect/send/receive — each with the
+    asyncio task identity of the caller, the response-queue depth around
+    the event, and the radio's identity-gate state, so a failed
+    assertion message can distinguish: the ``19 00`` answer was never
+    queued; it was queued but consumed by a different task than the read
+    that wanted it; or the gate state/epoch moved underneath the read.
+    Every override forwards the exact original call and re-raises the
+    original exception unchanged; only recording is added.
+    """
+
+    MAX_TRACE = 100
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self._diag_events: deque[str] = deque(maxlen=self.MAX_TRACE)
+        self._diag_t0 = time.monotonic()
+        self._diag_radio: object | None = None
+
+    def bind_radio(self, radio: object) -> None:
+        self._diag_radio = radio
+
+    def _diag_record(self, kind: str, detail: str) -> None:
+        task = asyncio.current_task()
+        self._diag_events.append(
+            f"t={time.monotonic() - self._diag_t0:7.3f} {kind:<12} "
+            f"by={_diag_task_id(task)} q={self._responses.qsize()} "
+            f"{detail} | {_diag_gate_state(self._diag_radio)}"
+        )
+
+    def trace_text(self) -> str:
+        return (
+            f"MOR-3078 link trace (last {len(self._diag_events)} "
+            f"of max {self.MAX_TRACE} events, newest last):\n"
+            + "\n".join(self._diag_events)
+        )
+
+    async def connect(self) -> None:
+        fail = self._fail_connect
+        self._diag_record(
+            "connect",
+            f"call#{self.connect_calls + 1} "
+            f"fail={type(fail).__name__ if fail is not None else None}",
+        )
+        try:
+            await super().connect()
+        except BaseException as exc:
+            self._diag_record("connect-err", f"{type(exc).__name__}: {exc}")
+            raise
+        self._diag_record("connect-ok", f"call#{self.connect_calls}")
+
+    async def disconnect(self) -> None:
+        self._diag_record("disconnect", f"call#{self.disconnect_calls + 1}")
+        await super().disconnect()
+
+    async def send(self, frame: bytes) -> None:
+        payload = bytes(frame)
+        cmd = payload[4:-1].hex() if len(payload) > 5 else payload.hex()
+        idq_before = self.identity_queries
+        q_before = self._responses.qsize()
+        try:
+            await super().send(frame)
+        except BaseException as exc:
+            self._diag_record("send-err", f"cmd={cmd} {type(exc).__name__}: {exc}")
+            raise
+        self._diag_record(
+            "send",
+            f"cmd={cmd} idq={self.identity_queries} "
+            f"answered={self.identity_queries > idq_before and bool(self.answer_identity)} "
+            f"q_delta={self._responses.qsize() - q_before}",
+        )
+
+    async def receive(self, timeout: float | None = None) -> bytes | None:
+        q_before = self._responses.qsize()
+        try:
+            result = await super().receive(timeout)
+        except asyncio.CancelledError:
+            self._diag_record("recv-cancel", f"tmo={timeout} q_before={q_before}")
+            raise
+        except BaseException as exc:
+            self._diag_record("recv-err", f"tmo={timeout} {type(exc).__name__}: {exc}")
+            raise
+        got = "silence" if result is None else bytes(result).hex()
+        self._diag_record(
+            "recv",
+            f"tmo={timeout} got={got} "
+            f"q_before={q_before} q_after={self._responses.qsize()}",
+        )
+        return result
+
+
 @asynccontextmanager
 async def _served_through_cli(
-    radio: object, *, bridge: str | None = None
+    radio: object,
+    *,
+    bridge: str | None = None,
+    expect_rc: int = 0,
 ) -> AsyncIterator[WebServer]:
     """Run ``rigplane web`` through the real ``cli/__init__.py: _run``.
 
@@ -2544,7 +2691,9 @@ async def _served_through_cli(
     it and requires exit code 0. ``serve_forever`` is replaced by start /
     wait / stop so no signal handler is installed, and the listener bind is
     faked. ``bridge`` selects the ``--bridge`` value (None keeps the
-    harness default of no bridge at all).
+    harness default of no bridge at all). ``expect_rc`` requires that exit
+    code instead of a served server (MOR-3078: the explicit
+    ``--bridge=<DEVICE>`` fail-hard path exits 1 without serving).
     """
 
     from rigplane.cli import _build_parser, _run
@@ -2581,16 +2730,22 @@ async def _served_through_cli(
         run = asyncio.create_task(_run(args))
         try:
             await _wait_until(lambda: bool(served) or run.done(), timeout_s=10.0)
-            assert served, (
-                f"rigplane web exited with {run.result()} instead of serving"
-                if run.done()
-                else "rigplane web did not finish starting"
-            )
-            yield served[0]
+            if expect_rc == 0:
+                assert served, (
+                    f"rigplane web exited with {run.result()} instead of serving"
+                    if run.done()
+                    else "rigplane web did not finish starting"
+                )
+                yield served[0]
+            else:
+                assert not served, (
+                    "rigplane web served where a hard failure was required"
+                )
+                yield None
         finally:
             release.set()
             rc = await asyncio.wait_for(run, timeout=10.0)
-    assert rc == 0
+    assert rc == expect_rc
 
 
 def _startup_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
@@ -2742,14 +2897,22 @@ async def test_http_connect_and_power_on_leave_the_port_retry_running(
     ``/api/v1/radio/connect`` and the power-on reconnect refuse with the
     WebSocket ``radio_connect`` handler's ``backend_recovering`` error, and
     the port still connects when it appears.
+
+    MOR-3078: this is the test the Linux quick runner failed (the port
+    appeared, the identity read stayed silent, CONNECTED never latched
+    inside the budget; cause unknown). The link here is wrapped in the
+    transparent ``_TracedCivLink`` witness, so a failed assertion message
+    carries the bounded link trace — task identities of every send and
+    receive, queue depths, gate/epoch state — instead of only the timeout.
     """
 
-    from test_icom7610_serial_radio import _FakeSerialCivLink, _wait_until
+    from test_icom7610_serial_radio import _wait_until
     from test_web_server_coverage import _FakeWriter, _reader_with, _response_json
 
     device = str(tmp_path / "cu.usbserial-1420")
-    link = _FakeSerialCivLink(fail_connect=_port_missing_error(device))
+    link = _TracedCivLink(fail_connect=_port_missing_error(device))
     radio = _fast_retry_serial_radio(device, link)
+    link.bind_radio(radio)
 
     async with _served_through_cli(radio) as server:
         connect_writer, power_writer = _FakeWriter(), _FakeWriter()
@@ -2763,14 +2926,132 @@ async def test_http_connect_and_power_on_leave_the_port_retry_running(
         )
 
         calls = link.connect_calls
-        assert await _wait_until(lambda: link.connect_calls > calls, timeout_s=5.0)
+        assert await _wait_until(lambda: link.connect_calls > calls, timeout_s=5.0), (
+            link.trace_text()
+        )
         link._fail_connect = None
-        assert await _wait_until(lambda: radio.connected, timeout_s=5.0)
+        assert await _wait_until(lambda: radio.connected, timeout_s=5.0), (
+            link.trace_text()
+        )
 
     for writer in (connect_writer, power_writer):
         status, body = _response_json(writer)
         assert status == 409
         assert body["error"] == "backend_recovering"
+
+
+@pytest.mark.asyncio
+async def test_a_missed_first_identity_read_still_connects_within_the_test_budget(
+    tmp_path: Path,
+) -> None:
+    """MOR-3078: one gate miss must not outrun the suite's test budget.
+
+    The Linux quick runner (``quick.yml`` runs the suite under ``-n auto
+    --maxprocesses 4``) failed the missing-port test after the port
+    appeared: the logs show the identity read answering nothing (the
+    NO_RESPONSE warning fired twice) and CONNECTED never latching inside
+    the test budget. The original failure is neither reproduced nor
+    explained here — the root cause is still unknown. What this test
+    pins is the clock regression the fixture can force deterministically:
+    the fake answers ``19 00`` for real, but only from the fifth query on
+    (the gate read and the first three re-reads miss), so the recovery
+    must ride the re-read ladder and still connect inside the same 5 s
+    budget the missing-port test uses. The answer window itself stays at
+    its production width; only the retry ladder runs on the fixture
+    clock.
+    """
+
+    from rigplane.core.radio_protocol import RadioIdentityStatus
+    from test_icom7610_serial_radio import _FakeSerialCivLink, _wait_until
+
+    class _AnswersFromQueryLink(_FakeSerialCivLink):
+        """Answers ``19 00`` for real, but only from the Nth query on."""
+
+        def __init__(
+            self,
+            *,
+            answer_from_query: int,
+            fail_connect: BaseException | None,
+        ) -> None:
+            super().__init__(fail_connect=fail_connect)
+            self.answer_from_query = answer_from_query
+
+        @property
+        def answer_identity(self) -> bool:
+            return self.identity_queries >= self.answer_from_query
+
+        @answer_identity.setter
+        def answer_identity(self, value: bool) -> None:
+            _ = value  # the base __init__ writes the static flag; ignored
+
+    device = str(tmp_path / "cu.usbserial-1420")
+    link = _AnswersFromQueryLink(
+        # The gate read and the first three re-reads are suppressed
+        # before the fourth re-read's answer must land inside the 5 s
+        # budget — only a compressed retry ladder meets it (production:
+        # 1+2+4 s of backoff alone exceeds the budget after the read
+        # windows). The suppression tests the clock, not any claim about
+        # why the original Linux run lost its replies.
+        answer_from_query=5,
+        fail_connect=_port_missing_error(device),
+    )
+    radio = _fast_retry_serial_radio(device, link)
+
+    async with _served_through_cli(radio) as server:
+        assert server._served_without_port is True
+        assert await _wait_until(lambda: link.connect_calls >= 2, timeout_s=5.0)
+        link._fail_connect = None  # the port appears
+
+        # The gate misses and the re-read owns the open link — the state
+        # the Linux quick run's logs point at (NO_RESPONSE with the
+        # re-read task running), whatever lost the replies there.
+        assert await _wait_until(
+            lambda: (
+                radio.connection_identity is not None
+                and radio.connection_identity.status is RadioIdentityStatus.NO_RESPONSE
+                and radio._serial_identity_reread_task is not None
+            ),
+            timeout_s=5.0,
+        )
+
+        assert await _wait_until(lambda: radio.connected, timeout_s=5.0)
+
+
+@pytest.mark.asyncio
+async def test_traced_link_witness_is_transparent() -> None:
+    """MOR-3078 diagnostic helper: the witness records, never alters.
+
+    Pins exactly what the diagnostic relies on: the traced link answers
+    the identity read exactly as the base fake does, records send/receive
+    events naming the consuming asyncio task, keeps the response-queue
+    accounting exact, and lets a cancelled receive raise
+    ``CancelledError`` unchanged.
+    """
+
+    link = _TracedCivLink()
+    link.bind_radio(_fast_retry_serial_radio("/dev/ttyUSB0", link))
+    await link.connect()
+
+    query = bytes((0xFE, 0xFE, 0xE0, 0x94, 0x19, 0x00, 0xFD))
+    await link.send(query)
+    assert link.identity_queries == 1
+    assert link._responses.qsize() == 1  # the answer is queued, unread
+    reply = await link.receive(timeout=0.2)
+    assert reply is not None and b"\x19\x00\x94" in reply
+    assert link._responses.qsize() == 0
+
+    trace = link.trace_text()
+    assert "send" in trace and "recv" in trace
+    # The consuming task's identity is in the trace, so a wrong-consumer
+    # read is attributable from the assertion message alone.
+    assert f"{id(asyncio.current_task()):x}" in trace
+
+    rx = asyncio.create_task(link.receive(timeout=5.0), name="diag-cancel-probe")
+    await asyncio.sleep(0.01)
+    rx.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await rx
+    assert "recv-cancel" in link.trace_text()
 
 
 @pytest.mark.asyncio
@@ -3180,3 +3461,141 @@ async def test_audio_auto_start_skips_quietly_while_identity_holds(
                 for record in caplog.records
             )
             assert _audio_scope_error_records(caplog) == []
+
+
+def test_identity_hold_predicate_requires_a_disconnected_radio() -> None:
+    """MOR-3078: one shared hold predicate; checking on a connected radio is no hold.
+
+    The CLI bridge deferral, the web startup gate and the no_response
+    print asked the same question three ways, and none required the radio
+    to be disconnected: a stale ``checking`` left on a connected radio
+    read as a hold. The shared predicate (``core.radio_protocol:
+    serial_identity_hold``) returns the hold status only for
+    checking/no_response on a radio that is NOT connected; anything else
+    the attribute may hold — including the ``Mock`` a test double
+    returns — is no hold, decided by ``isinstance``, never by truthiness.
+    """
+    from rigplane.core.radio_protocol import (
+        RadioIdentity,
+        RadioIdentityStatus,
+        serial_identity_hold,
+    )
+    from rigplane.web.web_startup import _serial_identity_pending
+
+    def _radio(status: RadioIdentityStatus, *, connected: bool) -> SimpleNamespace:
+        return SimpleNamespace(
+            connection_identity=RadioIdentity(status=status, expected_model="IC-7300"),
+            connected=connected,
+        )
+
+    held = _radio(RadioIdentityStatus.NO_RESPONSE, connected=False)
+    assert serial_identity_hold(held) is RadioIdentityStatus.NO_RESPONSE
+    assert _serial_identity_pending(SimpleNamespace(_radio=held)) is True
+
+    # A stale checking on a connected radio describes nothing: not a hold.
+    checking_connected = _radio(RadioIdentityStatus.CHECKING, connected=True)
+    assert serial_identity_hold(checking_connected) is None
+    assert _serial_identity_pending(SimpleNamespace(_radio=checking_connected)) is (
+        False
+    )
+
+    answered = _radio(RadioIdentityStatus.UNVERIFIED, connected=True)
+    assert serial_identity_hold(answered) is None
+
+    mock_radio = MagicMock()
+    assert serial_identity_hold(mock_radio) is None
+
+
+@pytest.mark.asyncio
+async def test_audio_auto_start_defers_then_starts_exactly_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """MOR-3078: the deferred auto-start runs once the radio answers.
+
+    The MOR-3081 deferral was permanent — the auto bridge never started
+    unless the operator asked from the UI. The deferred start is armed at
+    deferral time and runs exactly one ``start_audio_bridge`` once the
+    identity hold has cleared AND the connect latched; a later duplicate
+    trigger must not start a second bridge, and nothing may fire once
+    the server has stopped.
+    """
+
+    from test_icom7610_serial_radio import _wait_until
+
+    link, radio = _identity_held_gate_radio()
+    bridge_start = AsyncMock()
+    with (
+        patch.object(WebServer, "start_audio_bridge", bridge_start),
+        caplog.at_level(logging.WARNING),
+    ):
+        async with _served_through_cli(radio, bridge="auto") as server:
+            assert server is not None
+            assert bridge_start.await_count == 0  # deferred, not attempted
+            assert any(
+                record.name == "rigplane.cli"
+                and "audio bridge auto-start deferred" in record.getMessage()
+                for record in caplog.records
+            )
+
+            link.policy_answer = True
+            assert await _wait_until(lambda: radio.connected, timeout_s=5.0)
+            assert await _wait_until(
+                lambda: bridge_start.await_count == 1, timeout_s=5.0
+            )
+            await asyncio.sleep(0.5)  # a duplicate trigger would land here
+            assert bridge_start.await_count == 1
+            assert bridge_start.await_args is not None
+            assert bridge_start.await_args.kwargs.get("device_name") is None
+
+    # The server is down: no start may fire after stop begins.
+    await asyncio.sleep(0.2)
+    assert bridge_start.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_deferred_auto_bridge_never_starts_after_stop_begins(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """MOR-3078: a deferral that never sees the radio answer dies with the server.
+
+    The deferred start belongs to the web application lifetime: the
+    shutdown that begins when ``serve_forever`` ends must cancel it
+    before it can start a bridge, and nothing may fire once the server
+    is down.
+    """
+
+    link, radio = _identity_held_gate_radio()
+    bridge_start = AsyncMock()
+    with (
+        patch.object(WebServer, "start_audio_bridge", bridge_start),
+        caplog.at_level(logging.WARNING),
+    ):
+        async with _served_through_cli(radio, bridge="auto"):
+            assert bridge_start.await_count == 0
+            # The radio never answers; the block exits straight to shutdown.
+        await asyncio.sleep(0.3)
+        assert bridge_start.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_explicit_bridge_device_fails_hard_while_identity_held(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """MOR-3078: an explicit ``--bridge=<DEVICE>`` keeps failing while held.
+
+    The MOR-3081 docstring claimed this fail-hard behaviour but no test
+    pinned it: only the AUTO start defers; a concrete device name still
+    attempts the bridge at startup, fails against the held connect, and
+    exits non-zero instead of serving.
+    """
+
+    link, radio = _identity_held_gate_radio()
+    refused = RuntimeError("radio-RX start refused: the connect is held")
+    bridge_start = AsyncMock(side_effect=refused)
+    with patch.object(WebServer, "start_audio_bridge", bridge_start):
+        async with _served_through_cli(
+            radio, bridge="RigPlane Virtual Cable Output", expect_rc=1
+        ) as server:
+            assert server is None  # the harness asserts the non-zero exit
+    captured = capsys.readouterr()
+    assert "audio bridge failed" in captured.err
