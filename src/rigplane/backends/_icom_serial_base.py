@@ -21,7 +21,13 @@ from .._connection_state import RadioConnectionState
 from ..audio import AudioPacket
 from ..audio.lan_stream import SYNTHETIC_RX_IDENT
 from ..commands import parse_ack_nak
-from ..exceptions import AudioFormatError, CommandError, ConnectionError
+from ..core.radio_protocol import RadioIdentity, RadioIdentityStatus
+from ..exceptions import (
+    AudioFormatError,
+    CommandError,
+    ConnectionError,
+    TimeoutError as RigplaneTimeoutError,
+)
 from ..radio import CoreRadio
 from ..types import AudioCodec, ScopeCompletionPolicy, get_audio_capabilities
 
@@ -137,6 +143,12 @@ class _IcomSerialRadioBase(CoreRadio):
     # of the same absorbed-cancellation shape is a loud, bounded failure
     # instead of a 300s pytest-timeout / hung disconnect().
     _SERIAL_CIV_WATCHDOG_TEARDOWN_TIMEOUT_S = 5.0
+    # MOR-3071: backoff for the background identity re-read on the open
+    # link — 1, 2, 4 and 8 s, then every 15 s. Class attributes so tests
+    # can drive the cadence with virtual time (the same seam
+    # ``_SERIAL_WATCHDOG_RETRY_S`` uses).
+    _SERIAL_IDENTITY_REREAD_BACKOFF_S: tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)
+    _SERIAL_IDENTITY_REREAD_STEADY_S: float = 15.0
 
     def __init__(
         self,
@@ -276,6 +288,29 @@ class _IcomSerialRadioBase(CoreRadio):
         # MOR-2876: set once a port open succeeds; no sibling-port search
         # before that (``_maybe_rediscover_serial_device``).
         self._has_connected_once = False
+        # MOR-3071: typed identity of the radio on the open link. None until
+        # a connect attempt opens the session (a port that never opened has
+        # no identity — the #3902 path is unchanged); reset to ``checking``
+        # by every connect attempt; cleared by ``disconnect``.
+        self._connection_identity: RadioIdentity | None = None
+        # MOR-3071: the background re-read task that owns the open link
+        # while identity is ``no_response``.
+        self._serial_identity_reread_task: asyncio.Task[None] | None = None
+        # MOR-3071 round 4: the CI-V generation whose identity gate
+        # produced the recorded answer (set by ``_latch_serial_connected``).
+        # CONNECTED may latch only while this matches ``_civ_epoch``:
+        # every new link — a connect attempt or a soft_reconnect —
+        # advances the generation before its gate runs, so an answer can
+        # never be credited to a transport it was not recorded on.
+        # Cleared at the start of every connect attempt, in
+        # ``soft_reconnect``, ``disconnect`` and whenever the link the
+        # answer belonged to is declared dead or the hold is abandoned.
+        self._serial_identity_answer_epoch: int | None = None
+        # MOR-3071 round 4: True while a connect()/soft_reconnect()
+        # identity gate is awaiting its answer — one of the two states
+        # in which a task actively owns the open link for the identity
+        # phase (the other is a live re-read task).
+        self._serial_identity_gate_running = False
 
     # ------------------------------------------------------------------
     # Backend identity
@@ -368,6 +403,17 @@ class _IcomSerialRadioBase(CoreRadio):
             return False
         return self._serial_session.ready
 
+    @property
+    def connection_identity(self) -> RadioIdentity | None:
+        """Typed identity of the radio on the open link (MOR-3071).
+
+        ``None`` while no connect attempt has opened the session (and after
+        ``disconnect``); ``status`` is ``checking``/``no_response`` while the
+        identity phase owns the open link, and ``connected`` stays false
+        until a well-formed identity answer completes the connect.
+        """
+        return self._connection_identity
+
     # ------------------------------------------------------------------
     # Connect / disconnect / reconnect
     # ------------------------------------------------------------------
@@ -375,7 +421,21 @@ class _IcomSerialRadioBase(CoreRadio):
     async def connect(self) -> None:
         if self.connected:
             return
+        if self._identity_phase_owns_open_link():
+            # MOR-3071: the identity read (or its re-read) already owns
+            # the open link — the web power-on path would reopen it (and
+            # toggle DTR/RTS) for nothing. Round 5: ONE predicate, shared
+            # with the watchdog's guard.
+            return
 
+        # MOR-3071 round 4: a committed attempt opens a NEW link. The
+        # answer recorded for the old link no longer applies, and a live
+        # re-read task from an earlier hold must be cancelled before the
+        # reopen — it would otherwise wake up on the new transport,
+        # where the new gate's read is already the one reader of
+        # ``19 00``.
+        self._cancel_serial_identity_reread()
+        self._serial_identity_answer_epoch = None
         self._conn_state = RadioConnectionState.CONNECTING
         self._civ_stream_ready = False
         self._civ_recovering = False
@@ -394,6 +454,16 @@ class _IcomSerialRadioBase(CoreRadio):
         self.last_error = None
         self._has_connected_once = True
 
+        # A connect() over a runtime whose CI-V worker and RX pump still
+        # run (the web power-on route reconnects after a link-down
+        # declaration that deliberately leaves them alive) must not leave
+        # them bound to the retired generation: the stale pump would
+        # consume and drop every answer to the new epoch — the identity
+        # read first of all. The same discipline soft_reconnect applies
+        # before its reopen; no-ops on a first connect.
+        await self._stop_civ_worker()
+        await self._stop_civ_rx_pump()
+
         self._ctrl_transport = self._serial_session.control_transport  # type: ignore[assignment]
         self._civ_transport = self._serial_session.civ_transport  # type: ignore[assignment]
         self._advance_civ_generation("serial-connect")
@@ -403,16 +473,31 @@ class _IcomSerialRadioBase(CoreRadio):
         self._start_civ_data_watchdog()
         self._start_civ_worker()
 
-        self._conn_state = RadioConnectionState.CONNECTED
-        self._civ_stream_ready = self._serial_session.ready
-        self._civ_recovering = not self._civ_stream_ready
-        self._capture_serial_identity()
-        logger.info(
-            "Connected to %s over serial (%s @ %d baud)",
-            self.model,
-            self._serial_device,
-            self._serial_baudrate,
-        )
+        # MOR-3071: hold the connect until the radio answers the identity
+        # read. The RX pump and CI-V worker above must already run for the
+        # read to get its reply, but CONNECTED must not latch before the
+        # answer. On silence connect() returns without raising: the link
+        # stays open, the re-read task keeps asking, and the web serves in
+        # the radio-not-answering state.
+        self._serial_identity_gate_running = True
+        try:
+            identity_answered = await self._gate_serial_identity()
+        except Exception as exc:
+            # MOR-3071 round 5: what the gate does not translate itself
+            # (a write OSError on an opened-but-wrong port, CI-V runtime
+            # errors) follows the session-open failure contract above.
+            self._conn_state = RadioConnectionState.DISCONNECTED
+            self._civ_stream_ready = False
+            self._civ_recovering = False
+            self.last_error = (
+                f"Failed to read the radio identity on {self._serial_device}: {exc}"
+            )
+            raise ConnectionError(self.last_error) from exc
+        finally:
+            self._serial_identity_gate_running = False
+        if not identity_answered:
+            return
+        self._latch_serial_connected()
         if (
             self._managed_tx_composition is not None
             and self._serial_session.ready
@@ -425,6 +510,9 @@ class _IcomSerialRadioBase(CoreRadio):
 
     async def disconnect(self) -> None:
         # Always stop watchdog first to avoid orphan retry loops on failed reconnects.
+        self._cancel_serial_identity_reread()
+        self._connection_identity = None
+        self._serial_identity_answer_epoch = None
         await self._stop_civ_data_watchdog()
         await self._stop_serial_audio_driver()
         if (
@@ -450,7 +538,15 @@ class _IcomSerialRadioBase(CoreRadio):
         self._ctrl_transport = self._serial_session.control_transport  # type: ignore[assignment]
 
     async def soft_reconnect(self) -> None:
-        if self._serial_session.ready and self._civ_transport is not None:
+        if (
+            self._serial_session.ready
+            and self._civ_transport is not None
+            and self._serial_identity_answered_for_current_link()
+        ):
+            # MOR-3071 round 4: a ready link counts as recovered only
+            # when the identity gate answered on THIS CI-V generation. A
+            # ready session without an answer (an abandoned hold, a
+            # crashed gate) must fall through and re-gate.
             return
 
         if self._managed_tx_composition is not None:
@@ -458,6 +554,11 @@ class _IcomSerialRadioBase(CoreRadio):
         self._conn_state = RadioConnectionState.RECONNECTING
         self._civ_stream_ready = False
         self._civ_recovering = True
+        # MOR-3071 round 4: same discipline as connect() — the new link
+        # starts with no recorded answer and no old re-read task that
+        # could read on the new transport.
+        self._cancel_serial_identity_reread()
+        self._serial_identity_answer_epoch = None
         self._advance_civ_generation("serial-soft-reconnect")
         await self._stop_civ_worker()
         await self._stop_civ_rx_pump()
@@ -485,10 +586,30 @@ class _IcomSerialRadioBase(CoreRadio):
         self._start_civ_rx_pump()
         self._start_civ_worker()
 
-        self._conn_state = RadioConnectionState.CONNECTED
-        self._civ_stream_ready = self._serial_session.ready
-        self._civ_recovering = not self._civ_stream_ready
-        self._capture_serial_identity()
+        # MOR-3071: same identity gate as connect() — a replugged radio must
+        # answer before CONNECTED latches again. On silence the re-read task
+        # takes over the open link; the state stays CONNECTING (not
+        # RECONNECTING) so the watchdog's ready-branch cannot latch
+        # CONNECTED without an identity.
+        self._serial_identity_gate_running = True
+        try:
+            identity_answered = await self._gate_serial_identity()
+        except Exception as exc:
+            # MOR-3071 round 5: same contract as the reconnect-open
+            # failure above — keep the state the watchdog retries from.
+            self._conn_state = RadioConnectionState.RECONNECTING
+            self._civ_stream_ready = False
+            self._civ_recovering = True
+            self.last_error = (
+                f"Failed to read the radio identity on {self._serial_device}: {exc}"
+            )
+            raise ConnectionError(self.last_error) from exc
+        finally:
+            self._serial_identity_gate_running = False
+        if not identity_answered:
+            self._conn_state = RadioConnectionState.CONNECTING
+            return
+        self._latch_serial_connected()
         # MOR-1440 review round 2 (B1 item 2): this is the RECONNECTING ->
         # CONNECTED transition. Re-baseline the link-death detector here,
         # explicitly, rather than waiting for the next watchdog tick's
@@ -525,6 +646,331 @@ class _IcomSerialRadioBase(CoreRadio):
         self._civ_stream_ready = False
         self._civ_recovering = True
         self._start_civ_data_watchdog()
+
+    # ------------------------------------------------------------------
+    # Connect-time identity gate (MOR-3071)
+    # ------------------------------------------------------------------
+
+    def _identity_hold_status_active(self) -> bool:
+        identity = self._connection_identity
+        return identity is not None and identity.status in (
+            RadioIdentityStatus.CHECKING,
+            RadioIdentityStatus.NO_RESPONSE,
+        )
+
+    def _identity_phase_owns_open_link(self) -> bool:
+        """Whether the identity read (or its re-read) owns the open link.
+
+        True while the identity status is ``checking``/``no_response``,
+        the session is still *ready* — ``SerialCivLink`` keeps
+        ``connected`` after a recoverable error while ``healthy`` drops,
+        so ``connected`` alone cannot tell a live link from a dead one
+        (MOR-3071 round 2) — and a task is actually driving the hold:
+        its gate awaiting an answer, or its re-read task alive. A status
+        left behind by a crashed gate or an abandoned hold owns nothing
+        and must not block recovery (MOR-3071 round 4).
+        """
+        return (
+            self._identity_hold_status_active()
+            and self._serial_session.ready
+            and self._serial_identity_hold_has_owner()
+        )
+
+    def _serial_identity_hold_has_owner(self) -> bool:
+        """Whether a gate or re-read task actively drives the identity hold.
+
+        MOR-3071 round 4: ``checking``/``no_response`` alone must not
+        block recovery — a gate that crashed mid-read or an abandoned
+        hold leaves the status behind with nobody driving it. The hold
+        owns the open link only while its gate is awaiting an answer or
+        its re-read task is alive.
+        """
+        if self._serial_identity_gate_running:
+            return True
+        task = self._serial_identity_reread_task
+        return task is not None and not task.done()
+
+    def _serial_identity_answered_for_current_link(self) -> bool:
+        """Whether the identity gate answered for the CURRENT link.
+
+        MOR-3071 round 4 invariant: the answer is recorded with the CI-V
+        generation it was answered at (``_civ_epoch``, set in
+        ``_latch_serial_connected`` — reusing the same generation
+        mechanism as ``_advance_civ_generation``/``_managed_tx_armed_epoch``),
+        and every new link — a connect attempt or a soft_reconnect —
+        advances the generation before its gate runs. The session driver
+        itself is fixed per radio instance and installs a brand-new
+        transport on every connect, each such swap advancing the
+        generation, so an answer can never be credited to a transport it
+        was not recorded on — no matter which path swapped the link.
+        """
+        epoch = self._serial_identity_answer_epoch
+        return epoch is not None and epoch == self._civ_epoch
+
+    def _power_on_allowed_in_no_response(self) -> bool:
+        """Whether POWER ON may pass while the connect is held (MOR-3071).
+
+        The narrowest allowance past ``_check_connected``: POWER ON only,
+        only while the identity is ``no_response`` and the link is open —
+        MOR-2841's promise that Power ON from the UI stays available for a
+        switched-off radio. Everything else stays refused.
+        """
+        identity = self._connection_identity
+        return (
+            identity is not None
+            and identity.status is RadioIdentityStatus.NO_RESPONSE
+            and self._serial_session.connected
+        )
+
+    async def set_powerstat(self, on: bool) -> None:
+        """Power on/off with the MOR-3071 ``no_response`` POWER ON allowance.
+
+        POWER ON in ``no_response`` goes out on the open link through the
+        direct request-tracker path: ``_send_civ_raw`` would enter
+        ``_wait_for_civ_transport_recovery`` (``_connected`` is false while
+        the connect is held) and kick a fast ``soft_reconnect`` — a port
+        reopen that toggles DTR/RTS and that this phase must never do. The
+        re-read task then picks the radio up once it boots.
+        """
+        if on and self._power_on_allowed_in_no_response():
+            civ = self._commands.power_on(to_addr=self._radio_addr)
+            await self._execute_civ_raw(civ, wait_response=False)
+            return
+        await super().set_powerstat(on)
+
+    async def _read_serial_identity_payload(self) -> bytes | None:
+        """Send the profile's ``get_transceiver_id`` read; ``None`` = silence.
+
+        Runs on the direct request-tracker path (``_execute_civ_raw``), not
+        ``_send_civ_raw``: the latter's recovery wait would soft_reconnect
+        and reopen the port while CONNECTED is deliberately not latched.
+        The answer window is the existing CI-V answer timeout
+        (``_civ_get_timeout``). Returns ``b""`` when the profile declares
+        no identity read (connects as today, MOR-3064 part 4), the raw
+        payload bytes after the ``19 00`` echo when the addressed radio
+        answers, and ``None`` when nothing answered.
+        """
+        builder = getattr(self._commands, "get_transceiver_id", None)
+        if not callable(builder):
+            return b""
+        try:
+            request = builder(to_addr=self._radio_addr)
+        except CommandError:
+            # This profile's command map declares no identity read
+            # (shipped Icom profiles all do): connects as today.
+            return b""
+        try:
+            resp = await self._execute_civ_raw(request, wait_response=True)
+        except (RigplaneTimeoutError, asyncio.TimeoutError):
+            # ``_execute_civ_raw`` raises rigplane's TimeoutError (not
+            # asyncio's) when the answer window runs out — both are caught
+            # so a silent link reads as silence, never as a connect crash.
+            return None
+        except ConnectionError:
+            return None
+        if resp is None:
+            return None
+        # Only a well-formed reply from the addressed radio counts: the
+        # request tracker keys the answer to our own ``19 00`` request, and
+        # the source address must be the configured CI-V address (never
+        # compared the other way — the payload is not the address).
+        if resp.from_addr != self._radio_addr or not resp.data:
+            return None
+        return resp.data
+
+    async def _gate_serial_identity(self) -> bool:
+        """Run the identity read gate; True when the connect may proceed.
+
+        Resets the identity to ``checking``, sends the read once, and on a
+        well-formed answer records ``unverified`` with the raw
+        ``answered_id`` (no profile declares an expected ID yet, and the
+        CI-V address is deliberately not compared — it is user-settable).
+        On silence records ``no_response``, leaves the link open with a
+        plain ``last_error`` sentence, hands the link to the background
+        re-read task, and returns False — CONNECTED must not latch.
+        """
+        self._connection_identity = RadioIdentity(
+            status=RadioIdentityStatus.CHECKING,
+            expected_model=self.model,
+        )
+        payload = await self._read_serial_identity_payload()
+        if payload is not None:
+            self._connection_identity = RadioIdentity(
+                status=RadioIdentityStatus.UNVERIFIED,
+                expected_model=self.model,
+                answered_id=payload.hex().upper() if payload else None,
+            )
+            return True
+        self._connection_identity = RadioIdentity(
+            status=RadioIdentityStatus.NO_RESPONSE,
+            expected_model=self.model,
+        )
+        self.last_error = (
+            f"No answer from the radio on {self._serial_device} "
+            f"({self.model} profile, {self._serial_baudrate} baud): another "
+            "radio may be on this port, or it is switched off."
+        )
+        logger.warning(
+            "rigplane (%s): no answer to the identity read on %s "
+            "(%d baud); holding the connect — the re-read task keeps "
+            "asking on the open link",
+            self.model,
+            self._serial_device,
+            self._serial_baudrate,
+        )
+        self._start_serial_identity_reread()
+        return False
+
+    def _latch_serial_connected(self) -> None:
+        """Latch CONNECTED after the identity gate passed (MOR-3071).
+
+        The same tail ``connect`` always ran, plus the reset of the MOR-1440
+        link-down evidence: identity-read timeouts banked while the connect
+        was held must not count against the link once CONNECTED latches.
+        Round 4 also records the CI-V generation the answer belongs to —
+        the one fact every later CONNECTED transition checks against.
+        """
+        self._cancel_serial_identity_reread()
+        self._serial_identity_answer_epoch = self._civ_epoch
+        self._conn_state = RadioConnectionState.CONNECTED
+        self._civ_stream_ready = self._serial_session.ready
+        self._civ_recovering = not self._civ_stream_ready
+        self._capture_serial_identity()
+        self._civ_watchdog_rebaseline()
+        logger.info(
+            "Connected to %s over serial (%s @ %d baud)",
+            self.model,
+            self._serial_device,
+            self._serial_baudrate,
+        )
+
+    def _start_serial_identity_reread(self) -> None:
+        """Start the background identity re-read unless one already runs."""
+        task = self._serial_identity_reread_task
+        if task is not None and not task.done():
+            return
+        self._serial_identity_reread_task = asyncio.create_task(
+            self._serial_identity_reread_loop(),
+            name="serial-identity-reread",
+        )
+
+    def _cancel_serial_identity_reread(self) -> None:
+        task = self._serial_identity_reread_task
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+        self._serial_identity_reread_task = None
+
+    def _abandon_serial_identity_hold(
+        self, reason: str, *, exc: BaseException | None = None
+    ) -> None:
+        """Leave an identity hold whose link died (MOR-3071 round 2).
+
+        ``SerialCivLink`` keeps ``connected`` set on a dead link, so the
+        hold would never trigger MOR-1440 detection (CONNECTED-only) or
+        ``soft_reconnect``; drop it into the watchdog's recovery state.
+
+        Round 4: the recorded identity answer dies with the hold — the
+        recovery link must re-answer before anything latches again. The
+        identity itself stays ``None`` (not the last hold status): the
+        hold's link is gone, ``last_error`` below carries the story of
+        what happened, and the watchdog's very next ``soft_reconnect``
+        re-runs the gate, which restores ``checking`` and then the real
+        status within one recovery cycle. A kept ``checking``/
+        ``no_response`` would instead describe a hold nobody drives
+        (its re-read task is cancelled below) — the round-2 null
+        semantics, now stated explicitly.
+        """
+        self._cancel_serial_identity_reread()
+        self._connection_identity = None
+        self._serial_identity_answer_epoch = None
+        self._conn_state = RadioConnectionState.RECONNECTING
+        self._civ_stream_ready = False
+        self._civ_recovering = True
+        self.last_error = (
+            f"The serial link on {self._serial_device} failed while waiting "
+            f"for the {self.model} identity answer; reconnecting."
+        )
+        logger.warning(
+            "rigplane (%s): abandoning the identity hold on %s: %s",
+            self.model,
+            self._serial_device,
+            reason,
+            exc_info=exc,
+        )
+
+    async def _serial_identity_reread_loop(self) -> None:
+        """Re-read ``19 00`` on the open link until the radio answers.
+
+        Backoff 1, 2, 4 and 8 s, then every 15 s. Never reopens the port —
+        every serial open toggles DTR/RTS (``core/serial_open.py``) — and
+        leaves the loop to ``_latch_serial_connected`` as soon as the
+        identity phase stops owning the link (answer, disconnect, or a
+        link that died mid-hold — MOR-3071 round 2 hands the link to the
+        watchdog's recovery instead).
+        """
+        attempts = 0
+        try:
+            while True:
+                backoff = self._SERIAL_IDENTITY_REREAD_BACKOFF_S
+                delay = (
+                    backoff[attempts]
+                    if attempts < len(backoff)
+                    else self._SERIAL_IDENTITY_REREAD_STEADY_S
+                )
+                attempts += 1
+                await asyncio.sleep(delay)
+                if not self._identity_phase_owns_open_link():
+                    if self._identity_hold_status_active():
+                        # Still in the hold, but the link died under it:
+                        # hand it to the watchdog's recovery (round 2).
+                        self._abandon_serial_identity_hold(
+                            "the serial link stopped being ready"
+                        )
+                    return
+                payload = await self._read_serial_identity_payload()
+                if payload is None:
+                    continue
+                self._connection_identity = RadioIdentity(
+                    status=RadioIdentityStatus.UNVERIFIED,
+                    expected_model=self.model,
+                    answered_id=payload.hex().upper() if payload else None,
+                )
+                self.last_error = None
+                self._latch_serial_connected()
+                if (
+                    self._managed_tx_composition is not None
+                    and self._serial_session.ready
+                    and self._civ_transport is not None
+                ):
+                    try:
+                        await self._arm_managed_tx()
+                    except Exception:
+                        # MOR-3071 round 4: ``connect()`` lets an
+                        # ``_arm_managed_tx`` failure propagate to its
+                        # caller only AFTER the latch — CONNECTED, the
+                        # stream flags and the identity survive it. The
+                        # re-read has no caller to raise to: the same
+                        # failure is logged with its traceback and the
+                        # latch stands (the link has already answered).
+                        logger.error(
+                            "rigplane (%s): managed TX arming failed after "
+                            "the identity answer on %s; the connection "
+                            "stays up",
+                            self.model,
+                            self._serial_device,
+                            exc_info=True,
+                        )
+                return
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            # An OSError from a dead writer (or any other non-cancel
+            # error, ``_arm_managed_tx`` above included) must not kill
+            # the re-read with an unretrieved task exception — hand the
+            # link to the watchdog's recovery, which reopens and re-gates.
+            self._abandon_serial_identity_hold(
+                f"the identity re-read failed: {exc}", exc=exc
+            )
 
     # ------------------------------------------------------------------
     # Renumbered-node rediscovery (MOR-1453)
@@ -1069,13 +1515,31 @@ class _IcomSerialRadioBase(CoreRadio):
                     RadioConnectionState.RECONNECTING,
                 ):
                     continue
+                if self._identity_phase_owns_open_link():
+                    # MOR-3071: the identity phase owns the open link and
+                    # its re-read task retries ``19 00`` in place — the
+                    # watchdog must neither soft_reconnect nor reopen
+                    # here (every open toggles DTR/RTS), and its
+                    # ready-branch must not latch CONNECTED without an
+                    # identity answer.
+                    continue
                 if (
                     self._conn_state == RadioConnectionState.CONNECTED
                     and self._serial_civ_timeout_evidence_crossed_threshold()
                 ):
                     await self._declare_serial_link_down()
                     continue
-                if self._serial_session.ready:
+                if (
+                    self._serial_session.ready
+                    and self._serial_identity_answered_for_current_link()
+                ):
+                    # MOR-3071 round 4: the ready-branch latches CONNECTED
+                    # only when the identity gate answered for the CURRENT
+                    # CI-V generation. A ready session without an answer
+                    # (an abandoned hold, a crashed gate, any RECONNECTING
+                    # leftover) falls through to soft_reconnect below,
+                    # which re-opens and runs the identity gate — it must
+                    # never latch here.
                     self._civ_stream_ready = True
                     self._civ_recovering = False
                     self._conn_state = RadioConnectionState.CONNECTED
@@ -1312,6 +1776,10 @@ class _IcomSerialRadioBase(CoreRadio):
         self._civ_stream_ready = False
         self._civ_recovering = True
         self._civ_consecutive_timeouts = 0
+        # MOR-3071 round 4: the identity answer belonged to the link that
+        # just died — the recovery soft_reconnect re-answers before
+        # CONNECTED may latch again.
+        self._serial_identity_answer_epoch = None
         await self._park_managed_tx()
         await self._stop_serial_audio_driver()
         await self._serial_session.disconnect()

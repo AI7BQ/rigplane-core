@@ -135,6 +135,7 @@ from .websocket import (  # noqa: TID251
 from ..radio_protocol import (
     CivTransactionCapable,
     ProviderOwnedStateCapable,
+    RadioIdentity,
     StateStoreCapable,
 )
 
@@ -1231,6 +1232,34 @@ class WebServer:
     def _radio_ready(self) -> bool:
         """Backend view of radio readiness (CI-V healthy)."""
         return bool(radio_ready(self._radio))
+
+    def _connection_identity_payload(self) -> dict[str, object] | None:
+        """The served ``connection.identity`` object (MOR-3071).
+
+        ``None`` when the radio has no identity yet — no connect attempt
+        opened its link (port missing, busy or denied), or the backend
+        publishes no identity at all. Read through the radio's
+        ``connection_identity`` (the typed record from
+        ``core/radio_protocol.py``); camelCase like the rest of
+        ``connection``.
+
+        Only a real ``RadioIdentity`` is serialised. Anything else the
+        attribute may hold (including the ``Mock`` a test double returns
+        for it) is served as ``null`` rather than raising on ``.status``.
+        """
+        identity = (
+            getattr(self._radio, "connection_identity", None)
+            if self._radio is not None
+            else None
+        )
+        if not isinstance(identity, RadioIdentity):
+            return None
+        return {
+            "status": identity.status.value,
+            "expectedModel": identity.expected_model,
+            "answeredModel": identity.answered_model,
+            "answeredId": identity.answered_id,
+        }
 
     async def ensure_startup_ready(self, timeout: float = 5.0) -> None:
         """Assert that the attached radio is ready before exposing the server."""
@@ -3499,6 +3528,7 @@ class WebServer:
                     "rigConnected": connected,
                     "radioReady": self._radio_ready(),
                     "controlConnected": control_connected,
+                    "identity": self._connection_identity_payload(),
                     "wsClients": len(self._client_tasks),
                 },
             },

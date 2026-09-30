@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ from rigplane.backends._icom_serial_base import (
 )
 from rigplane.backends.discovery import SerialPortCandidate
 from rigplane.backends.ic705 import Ic705SerialRadio
+from rigplane.backends.ic7300 import Ic7300SerialRadio
 from rigplane.backends.icom7610 import Icom7610SerialRadio
 from rigplane.backends.icom7610.drivers.serial_session import SerialCivTransport
 from rigplane import IC_7610_ADDR
@@ -25,7 +27,14 @@ from rigplane.commands import (
     build_civ_frame,
     parse_civ_frame,
 )
+from rigplane.core.acquisition_scheduler import AcquisitionScheduler
 from rigplane.core.civ import CivRequestKey
+from rigplane.core.state_acquisition_policy import (
+    AcquisitionPolicy,
+    FieldCapability,
+    RadioAcquisitionProfile,
+)
+from rigplane.core.state_pipeline_contracts import FieldPath
 from rigplane.core.state_store import StateStore
 from rigplane.exceptions import CommandError, ConnectionError
 from rigplane.exceptions import TimeoutError as RigplaneTimeoutError
@@ -36,6 +45,16 @@ from rigplane.runtime.managed_tx_composition import (
 from rigplane.runtime.managed_tx_state import ActuationResult, ManagedTxOutcome
 from rigplane.types import AudioCodec
 from rigplane.types import bcd_encode
+from rigplane.web.server import WebConfig, WebServer
+from rigplane.web.web_startup import _await_initial_state_acquisition
+
+try:  # MOR-3071: absent on the merge-base — the identity-gate tests below
+    # fail first there (RED); the try keeps the module collectable so each
+    # failure is an individual, behavioral one.
+    from rigplane.core.radio_protocol import RadioIdentity, RadioIdentityStatus
+except ImportError:  # pragma: no cover — RED-only path on the merge-base
+    RadioIdentity = None  # type: ignore[assignment,misc]
+    RadioIdentityStatus = None  # type: ignore[assignment,misc]
 
 
 @pytest.fixture(autouse=True)
@@ -155,6 +174,7 @@ class _FakeSerialCivLink:
         fail_connect_calls_exc: BaseException | None = None,
         lifecycle_events: list[tuple[str, object | None]] | None = None,
         ptt_off_answer: int | None = 0xFB,
+        answer_identity: bool = True,
     ) -> None:
         self._fail_connect = fail_connect
         self._fail_connect_calls = set(fail_connect_calls or set())
@@ -170,6 +190,12 @@ class _FakeSerialCivLink:
         self.device_history: list[str] = []
         self.lifecycle_events = lifecycle_events
         self.ptt_off_answer = ptt_off_answer
+        # MOR-3071: every serial connect now gates CONNECTED on the
+        # profile's identity read (19 00), so by default the fake answers
+        # it like a real radio would; tests that need an identity-silent
+        # link (the no_response gate suite) pass answer_identity=False.
+        self.answer_identity = answer_identity
+        self.identity_queries = 0
 
     def set_device(self, device: str) -> None:
         self.device_history.append(device)
@@ -204,6 +230,28 @@ class _FakeSerialCivLink:
         send_no = len(self.sent_frames)
         for response in self._responses_by_send.pop(send_no, []):
             self._responses.put_nowait(response)
+        # MOR-3071: the connect-time identity read. The reply is a real
+        # 19 00 answer from the frame's own radio address, carrying the
+        # model-ID byte (0x94 — the payload is opaque and never compared
+        # against the CI-V address).
+        if payload[4:-1] == b"\x19\x00":
+            self.identity_queries += 1
+            if self.answer_identity:
+                self._responses.put_nowait(
+                    bytes(
+                        (
+                            0xFE,
+                            0xFE,
+                            payload[3],
+                            payload[2],
+                            0x19,
+                            0x00,
+                            0x94,
+                            0xFD,
+                        )
+                    )
+                )
+            return
         # ``CoreRadio.actuate`` waits for the answer to the ``1C 00 00`` unkey
         # and distrusts it while another write's answer may be unclaimed
         # (MOR-2860), so the managed TX writes are answered here: FB for PTT ON
@@ -289,7 +337,8 @@ class _FakeUsbAudioDriver:
 @pytest.mark.asyncio
 async def test_serial_radio_connect_disconnect_and_core_command_execution() -> None:
     link = _FakeSerialCivLink()
-    link.queue_response_on_send(1, _freq_response_frame(14_074_000))
+    # Send #1 is the MOR-3071 identity read (answered by the fake itself).
+    link.queue_response_on_send(2, _freq_response_frame(14_074_000))
     radio = Icom7610SerialRadio(
         device="/dev/ttyUSB0",
         civ_link=link,
@@ -2075,19 +2124,23 @@ async def test_serial_scope_enable_disable_full_lifecycle_commands() -> None:
         civ = parse_civ_frame(frame)
         signatures.append((civ.command, civ.sub, civ.data))
 
-    assert len(signatures) >= 4, (
-        f"Expected at least 4 scope CI-V frames, got {len(signatures)}"
+    assert len(signatures) >= 5, (
+        f"Expected at least 5 CI-V frames (identity read + 4 scope), got {len(signatures)}"
     )
-    assert signatures[0] == (0x27, 0x10, b"\x01")
-    assert signatures[1] == (0x27, 0x11, b"\x01")
-    assert signatures[2] == (0x27, 0x11, b"\x00")
-    assert signatures[3] == (0x27, 0x10, b"\x00")
+    # MOR-3071: connect sends the identity read first (its answer carries
+    # the 0x94 payload, not the request).
+    assert signatures[0] == (0x19, 0x00, b"")
+    assert signatures[1] == (0x27, 0x10, b"\x01")
+    assert signatures[2] == (0x27, 0x11, b"\x01")
+    assert signatures[3] == (0x27, 0x11, b"\x00")
+    assert signatures[4] == (0x27, 0x10, b"\x00")
 
 
 @pytest.mark.asyncio
 async def test_serial_scope_capture_scope_frame() -> None:
     link = _FakeSerialCivLink()
-    link.queue_response_on_send(1, _scope_wave_frame(pixels=b"\x31\x32\x33"))
+    # Send #1 is the MOR-3071 identity read (answered by the fake itself).
+    link.queue_response_on_send(2, _scope_wave_frame(pixels=b"\x31\x32\x33"))
     radio = Icom7610SerialRadio(
         device="/dev/ttyUSB0",
         civ_link=link,
@@ -2106,7 +2159,8 @@ async def test_serial_scope_capture_scope_frame() -> None:
 @pytest.mark.asyncio
 async def test_serial_scope_callback_streaming_path() -> None:
     link = _FakeSerialCivLink()
-    link.queue_response_on_send(1, _scope_wave_frame(pixels=b"\x51\x52"))
+    # Send #1 is the MOR-3071 identity read (answered by the fake itself).
+    link.queue_response_on_send(2, _scope_wave_frame(pixels=b"\x51\x52"))
     radio = Icom7610SerialRadio(
         device="/dev/ttyUSB0",
         civ_link=link,
@@ -2137,8 +2191,9 @@ async def test_serial_scope_low_baud_guardrail_rejects_without_override() -> Non
 @pytest.mark.asyncio
 async def test_scope_session_restore_preserves_panel_and_output_state_exactly() -> None:
     link = _FakeSerialCivLink()
-    link.queue_response_on_send(1, _scope_state_response(0x10, True))
-    link.queue_response_on_send(2, _scope_state_response(0x11, False))
+    # Send #1 is the MOR-3071 identity read (answered by the fake itself).
+    link.queue_response_on_send(2, _scope_state_response(0x10, True))
+    link.queue_response_on_send(3, _scope_state_response(0x11, False))
     radio = Icom7610SerialRadio(
         device="/dev/ttyUSB0",
         civ_link=link,
@@ -2158,6 +2213,7 @@ async def test_scope_session_restore_preserves_panel_and_output_state_exactly() 
     ]
     assert initial == (True, False)
     assert signatures == [
+        (0x19, 0x00, b""),  # MOR-3071 identity read on connect
         (0x27, 0x10, b""),
         (0x27, 0x11, b""),
         (0x27, 0x10, b"\x01"),
@@ -2197,7 +2253,9 @@ async def test_rejected_low_baud_scope_enable_never_emits_scope_off() -> None:
         if len(payload) >= 6
         for frame in [parse_civ_frame(payload)]
     ]
-    assert signatures == []
+    # Only the MOR-3071 identity read of connect() reached the wire — no
+    # scope frame at all.
+    assert signatures == [(0x19, 0x00, b"")]
     assert (0x27, 0x10, b"\x00") not in signatures
     assert (0x27, 0x11, b"\x00") not in signatures
 
@@ -2212,8 +2270,9 @@ async def test_verify_timeout_after_scope_on_rolls_back_exact_initial_state() ->
     )
 
     link = _FakeSerialCivLink()
-    link.queue_response_on_send(1, _scope_state_response(0x10, False))
-    link.queue_response_on_send(2, _scope_state_response(0x11, False))
+    # Send #1 is the MOR-3071 identity read (answered by the fake itself).
+    link.queue_response_on_send(2, _scope_state_response(0x10, False))
+    link.queue_response_on_send(3, _scope_state_response(0x11, False))
     radio = Icom7610SerialRadio(
         device="/dev/ttyUSB0",
         civ_link=link,
@@ -2241,6 +2300,7 @@ async def test_verify_timeout_after_scope_on_rolls_back_exact_initial_state() ->
         for frame in [parse_civ_frame(payload)]
     ]
     assert signatures == [
+        (0x19, 0x00, b""),  # MOR-3071 identity read on connect
         (0x27, 0x10, b""),
         (0x27, 0x11, b""),
         (0x27, 0x10, b"\x01"),
@@ -2286,8 +2346,10 @@ async def test_serial_scope_low_baud_guardrail_override_allows_with_warning(
 async def test_serial_scope_flood_does_not_starve_get_frequency() -> None:
     link = _FakeSerialCivLink()
     for _ in range(120):
-        link.queue_response_on_send(3, _scope_wave_frame(pixels=b"\x11\x12\x13"))
-    link.queue_response_on_send(3, _freq_response_frame(14_074_000))
+        # Send #1 is the MOR-3071 identity read (answered by the fake
+        # itself), so the flood starts one send later than it used to.
+        link.queue_response_on_send(4, _scope_wave_frame(pixels=b"\x11\x12\x13"))
+    link.queue_response_on_send(4, _freq_response_frame(14_074_000))
     radio = Icom7610SerialRadio(
         device="/dev/ttyUSB0",
         civ_link=link,
@@ -2446,3 +2508,797 @@ def test_serial_audio_duplex_mode_defaults_to_full_when_driver_raises() -> None:
         audio_driver=_RaisingDuplexUsbAudioDriver(),
     )
     assert radio.audio_duplex_mode == "full"
+
+
+# ---------------------------------------------------------------------------
+# MOR-3071: the Icom serial connect gates CONNECTED on the identity read.
+#
+# The owner's bench case: an IC-7300 profile on the FTX-1's CAT port
+# reports "connected". The seven tests of the Linear ticket, over the
+# shared fake serial link with an identity-answer policy — on the
+# merge-base (main 1790aae2) they fail first: nothing sends ``19 00``
+# there, and the ``connection_identity`` surface does not exist.
+#
+# Virtual time: the re-read backoff (1, 2, 4, 8 s, then every 15 s) and
+# the CI-V answer window are class/instance attributes, compressed here
+# to tens of milliseconds — the same seam the MOR-237 watchdog backoff
+# tests use.
+# ---------------------------------------------------------------------------
+
+
+class _GateSerialLink(_FakeSerialCivLink):
+    """Shared fake CI-V link with a scripted identity-answer policy.
+
+    ``send`` is overridden wholesale so the policy is the single source of
+    identity answers, both on the merge-base (where the parent never
+    answers ``19 00``) and on this branch: ``answer_identity=False`` keeps
+    the link identity-silent forever; ``answer_after_queries=N`` stays
+    silent for the first N ``19 00`` queries (the radio-comes-up-later
+    case, in query-count units of virtual time).
+    """
+
+    def __init__(
+        self,
+        *,
+        answer_identity: bool = True,
+        answer_after_queries: int = 0,
+        model_id: int = 0x94,
+    ) -> None:
+        super().__init__()
+        self.policy_answer = answer_identity
+        self.answer_after_queries = answer_after_queries
+        self.model_id = model_id
+        self.identity_queries = 0
+        # MOR-3071 round 2: writes fail with OSError while ``connected``
+        # lingers — the unplugged-cable shape of the real SerialCivLink.
+        self.fail_sends = False
+
+    async def connect(self) -> None:
+        await super().connect()
+        self.fail_sends = False  # the replugged device is back
+
+    async def send(self, frame: bytes) -> None:
+        if not self.connected:
+            raise ConnectionError("Serial CI-V link is disconnected.")
+        if self.fail_sends:
+            raise OSError("write failed: device unplugged")
+        payload = bytes(frame)
+        if self.lifecycle_events is not None:
+            self.lifecycle_events.append(("send", payload))
+        self.sent_frames.append(payload)
+        send_no = len(self.sent_frames)
+        for response in self._responses_by_send.pop(send_no, []):
+            self._responses.put_nowait(response)
+        if payload[4:-1] == b"\x19\x00":
+            self.identity_queries += 1
+            if self.policy_answer and (
+                self.identity_queries > self.answer_after_queries
+            ):
+                self.queue_response(
+                    build_civ_frame(
+                        CONTROLLER_ADDR,
+                        payload[2],
+                        0x19,
+                        sub=0x00,
+                        data=bytes((self.model_id,)),
+                    )
+                )
+            return
+        answer = {
+            b"\x1c\x00\x01": 0xFB,
+            b"\x17\xff": 0xFB,
+            b"\x1c\x01\x00": 0xFB,
+            b"\x1c\x00\x00": self.ptt_off_answer,
+        }.get(payload[4:-1])
+        if answer is not None:
+            self._responses.put_nowait(
+                bytes((0xFE, 0xFE, payload[3], payload[2], answer, 0xFD))
+            )
+
+
+def _gate_radio(link: _GateSerialLink) -> Ic7300SerialRadio:
+    """IC-7300 on a fake link, with the identity cadence compressed."""
+    radio = Ic7300SerialRadio(
+        device="/dev/ttyUSB0",
+        civ_link=link,
+        # Hermetic on any host (MOR-1453 seams): no OS port enumeration.
+        _enumerate_serial_ports_fn=lambda: [],
+    )
+    radio._civ_min_interval = 0.001
+    radio._civ_get_timeout = 0.05
+    # MOR-3071 re-read cadence compressed: 50/100/200/400 ms, then 500 ms
+    # steady (real time: 1/2/4/8 s, then every 15 s).
+    radio._SERIAL_IDENTITY_REREAD_BACKOFF_S = (0.05, 0.1, 0.2, 0.4)
+    radio._SERIAL_IDENTITY_REREAD_STEADY_S = 0.5
+    radio._SERIAL_WATCHDOG_INTERVAL_S = 0.01
+    return radio
+
+
+@pytest.mark.asyncio
+async def test_silent_port_holds_the_connect_and_rereads_without_reopen() -> None:
+    """Ticket test 1: the owner's case — the port never answers 19 00."""
+    link = _GateSerialLink(answer_identity=False)
+    radio = _gate_radio(link)
+
+    await radio.connect()  # returns without raising; the web starts and serves
+
+    assert radio.connected is False
+    assert radio.radio_ready is False
+    assert radio.conn_state is not RadioConnectionState.CONNECTED
+    identity = radio.connection_identity
+    assert identity is not None
+    assert identity.status is RadioIdentityStatus.NO_RESPONSE
+    # No state query frames and no TX arming: the only wire traffic is the
+    # identity read itself.
+    payloads = [frame[4:-1] for frame in link.sent_frames]
+    assert payloads
+    assert set(payloads) == {b"\x19\x00"}
+    assert radio._managed_tx_runtime is None
+    # One plain sentence naming the port, the profile model and the baud.
+    assert radio.last_error is not None
+    assert "/dev/ttyUSB0" in radio.last_error
+    assert "IC-7300" in radio.last_error
+    assert "115200" in radio.last_error
+
+    # Over the compressed backoff window (~1.2 s here; 60 s of the real
+    # 1/2/4/8/15 s cadence): the port opener is called exactly once and
+    # 19 00 keeps being re-sent on the open link.
+    await asyncio.sleep(1.2)
+    assert link.connect_calls == 1
+    assert link.identity_queries >= 4
+    assert radio.connected is False
+    assert radio.connection_identity is not None
+    assert radio.connection_identity.status is RadioIdentityStatus.NO_RESPONSE
+
+    # disconnect cancels the re-read and clears the identity.
+    await radio.disconnect()
+    assert radio.connection_identity is None
+
+
+@pytest.mark.asyncio
+async def test_radio_answering_later_completes_the_connect(tmp_path) -> None:
+    """Ticket test 2: the same link starts answering after a while."""
+    link = _GateSerialLink(answer_identity=True, answer_after_queries=2)
+    radio = _gate_radio(link)
+    composition = ManagedTxComposition(radio, config_path=tmp_path / "managed-tx.json")
+    install_managed_tx_composition(radio, composition)
+    arm_calls: list[int] = []
+    real_arm = radio._arm_managed_tx
+
+    async def _counting_arm() -> None:
+        arm_calls.append(1)
+        await real_arm()
+
+    radio._arm_managed_tx = _counting_arm  # type: ignore[assignment]
+
+    await radio.connect()
+    assert radio.connection_identity is not None
+    assert radio.connection_identity.status is RadioIdentityStatus.NO_RESPONSE
+    assert radio.connected is False
+
+    assert await _wait_until(lambda: radio.connected, timeout_s=3.0)
+    identity = radio.connection_identity
+    assert identity is not None
+    assert identity.status is RadioIdentityStatus.UNVERIFIED
+    assert identity.answered_id == "94"  # raw payload, uppercase hex
+    assert identity.expected_model == "IC-7300"
+    assert identity.answered_model is None
+    assert link.connect_calls == 1  # the opener is still called exactly once
+    assert arm_calls == [1]  # TX arms exactly once
+    assert radio.radio_ready is True
+
+    await radio.disconnect()
+    await composition.shutdown(asyncio.Event())
+
+
+@pytest.mark.asyncio
+async def test_answering_radio_connects_as_today() -> None:
+    """Ticket test 3: a link that answers at once connects as before."""
+    link = _GateSerialLink(answer_identity=True)
+    radio = _gate_radio(link)
+
+    await radio.connect()
+
+    assert radio.connected is True
+    assert radio.radio_ready is True
+    identity = radio.connection_identity
+    assert identity is not None
+    assert identity.status is RadioIdentityStatus.UNVERIFIED
+    assert identity.answered_id == "94"
+    assert link.sent_frames[0][4:-1] == b"\x19\x00"  # the gate read went first
+    await radio.disconnect()
+    assert radio.connection_identity is None
+
+
+@pytest.mark.asyncio
+async def test_soft_reconnect_onto_silent_port_never_latches_or_reopens() -> None:
+    """Ticket test 4: replug onto a silent port — checking, no_response, no reopen.
+
+    The watchdog stays RUNNING: its ``soft_reconnect`` performs the recovery,
+    and while that reopen runs its identity gate the identity-phase guard
+    (MOR-3071) must keep it from re-entering or reopening a second time.
+    """
+    link = _GateSerialLink(answer_identity=True)
+    radio = _gate_radio(link)
+    await radio.connect()
+    assert radio.connected is True
+
+    # The replug: the port comes back identity-silent and not ready; the
+    # running watchdog notices and soft_reconnects onto it once.
+    link.policy_answer = False  # the replugged port stays identity-silent
+    link.ready = False
+    link.healthy = False
+
+    assert await _wait_until(
+        lambda: (
+            radio.connection_identity is not None
+            and radio.connection_identity.status is RadioIdentityStatus.NO_RESPONSE
+        ),
+        timeout_s=3.0,
+    )
+    assert radio.connected is False
+    assert radio.conn_state is not RadioConnectionState.CONNECTED
+
+    opens_after_reconnect = link.connect_calls  # the watchdog's one reopen
+    assert opens_after_reconnect == 2
+    await asyncio.sleep(0.8)  # compressed re-read window
+    assert link.connect_calls == opens_after_reconnect  # no further reopen
+    assert link.identity_queries >= 3  # the gate read plus re-reads
+    assert radio.conn_state is not RadioConnectionState.CONNECTED
+    await radio.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_power_on_in_no_response_sends_one_frame_without_reopen() -> None:
+    """Ticket test 5: POWER ON stays available in no_response (MOR-2841)."""
+    link = _GateSerialLink(answer_identity=False)
+    radio = _gate_radio(link)
+    await radio.connect()
+    assert radio.connection_identity is not None
+    assert radio.connection_identity.status is RadioIdentityStatus.NO_RESPONSE
+
+    def power_frames() -> list[bytes]:
+        # POWER ON is cmd 0x18 with the 0x01 payload (build: ``18 01``).
+        return [frame for frame in link.sent_frames if frame[4] == 0x18]
+
+    assert power_frames() == []
+    await radio.set_powerstat(True)
+    assert len(power_frames()) == 1  # exactly one POWER ON frame, no ACK wait
+    assert link.connect_calls == 1  # no reopen
+
+    # Everything else stays refused while the connect is held.
+    with pytest.raises(ConnectionError):
+        await radio.get_freq()
+    with pytest.raises(ConnectionError):
+        await radio.set_powerstat(False)
+    await radio.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_dead_link_during_identity_hold_hands_over_to_recovery() -> None:
+    """Round 2: the link dies while the hold owns it — watchdog recovers."""
+    link = _GateSerialLink(answer_identity=False)
+    radio = _gate_radio(link)
+
+    await radio.connect()
+    identity = radio.connection_identity
+    assert identity is not None and identity.status is RadioIdentityStatus.NO_RESPONSE
+    assert (reread := radio._serial_identity_reread_task) is not None
+
+    # The cable is pulled: writes fail with OSError, the link reports
+    # itself not ready while ``connected`` lingers, and the first recovery
+    # reopen still finds no device; the replugged device answers again.
+    link.policy_answer = True
+    link.fail_sends = True
+    link.ready = False
+    link._fail_connect_calls = {2}
+
+    # The re-read does not die: it hands the link over and the radio leaves
+    # the hold (identity null, RECONNECTING, a last_error sentence).
+    await asyncio.wait_for(reread, timeout=1.0)
+    assert reread.exception() is None
+    assert radio.connection_identity is None
+    assert radio.conn_state is RadioConnectionState.RECONNECTING
+    assert radio.last_error and "/dev/ttyUSB0" in radio.last_error
+
+    # soft_reconnect reopened the port once the device was back; the
+    # identity gate ran again on the new link.
+    assert await _wait_until(lambda: radio.connected, timeout_s=3.0)
+    identity = radio.connection_identity
+    assert identity is not None and identity.status is RadioIdentityStatus.UNVERIFIED
+    assert link.connect_calls == 3  # initial open + failed reopen + reopen
+    await radio.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# MOR-3071 round 4: one invariant — CONNECTED latches only when the identity
+# gate has an answer for the CURRENT link (the same CI-V generation). All of
+# these tests run with the watchdog RUNNING: the recovery they pin is the
+# watchdog's, not a hand-driven state.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reread_read_error_is_logged_and_leaves_the_hold(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Round 2: an error raised by the re-read is logged, not swallowed.
+
+    Round 4: the watchdog stays RUNNING — after the handover it takes
+    the ready session through ``soft_reconnect`` (which re-runs the
+    identity gate) instead of latching CONNECTED without an answer.
+    """
+    import logging
+
+    link = _GateSerialLink(answer_identity=False)
+    radio = _gate_radio(link)
+    await radio.connect()
+
+    async def _exploding_read() -> bytes | None:
+        raise RuntimeError("identity read exploded")
+
+    radio._read_serial_identity_payload = _exploding_read  # type: ignore[assignment]
+    with caplog.at_level(logging.WARNING, logger="rigplane.backends._icom_serial_base"):
+        assert await _wait_until(
+            lambda: any(
+                "identity re-read" in r.getMessage() and r.exc_info
+                for r in caplog.records
+            ),
+            timeout_s=2.0,
+        )
+    # The hold was abandoned: no re-read task owns the link anymore.
+    assert radio._serial_identity_reread_task is None
+    # The RUNNING watchdog recovered by reopening — the gate inside each
+    # soft_reconnect raises the same error, so every backoff slot reopens.
+    assert await _wait_until(lambda: link.connect_calls >= 2, timeout_s=2.0)
+    identity = radio.connection_identity
+    assert identity is None or identity.status is RadioIdentityStatus.CHECKING
+    assert radio.conn_state is not RadioConnectionState.CONNECTED
+    await radio.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_reread_command_error_never_latches_and_gates_again() -> None:
+    """Round 4 (a): a CommandError from the identity read, session ready.
+
+    An unexpected exception type from ``_read_serial_identity_payload``
+    used to reach the abandon path with the session still ready, and the
+    watchdog's ready-branch latched CONNECTED with no answer at all.
+    The invariant: CONNECTED never latches without an answer, and the
+    recovery keeps re-running the identity gate.
+    """
+    link = _GateSerialLink(answer_identity=False)
+    radio = _gate_radio(link)
+    await radio.connect()  # held on silence; the re-read owns the link
+
+    async def _command_error_read() -> bytes | None:
+        raise CommandError("the radio rejected the identity read")
+
+    radio._read_serial_identity_payload = _command_error_read  # type: ignore[assignment]
+
+    # ~1.3 s: the abandon at the first re-read slot, then the watchdog's
+    # recovery attempts at the retry backoff (0.5 s, 1.0 s, ...). At no
+    # sample may CONNECTED have latched.
+    deadline = asyncio.get_running_loop().time() + 1.3
+    while asyncio.get_running_loop().time() < deadline:
+        assert radio.conn_state is not RadioConnectionState.CONNECTED
+        await asyncio.sleep(0.02)
+
+    # The gate ran again: each recovery attempt reopens and resets the
+    # identity to checking before the read raises.
+    assert await _wait_until(
+        lambda: (
+            radio.connection_identity is not None
+            and radio.connection_identity.status is RadioIdentityStatus.CHECKING
+        ),
+        timeout_s=1.0,
+    )
+    assert link.connect_calls >= 3  # the initial open plus re-gating reopens
+    await radio.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_ready_reconnecting_without_answer_runs_gate_not_latch() -> None:
+    """Round 4 (c): RECONNECTING, session reads ready, no answer for the
+    current link — the watchdog runs the gate, it does not latch."""
+    link = _GateSerialLink(answer_identity=False)
+    radio = _gate_radio(link)
+    await radio.connect()  # held on silence
+
+    real_read = radio._read_serial_identity_payload
+    read_calls = 0
+
+    async def _one_shot_error_read() -> bytes | None:
+        nonlocal read_calls
+        read_calls += 1
+        if read_calls == 2:  # the first re-read; the gate's read was call 1
+            raise RuntimeError("identity read exploded once")
+        return await real_read()
+
+    radio._read_serial_identity_payload = _one_shot_error_read  # type: ignore[assignment]
+
+    def _re_gated_hold() -> bool:
+        identity = radio.connection_identity
+        return (
+            link.connect_calls == 2
+            and identity is not None
+            and identity.status is RadioIdentityStatus.NO_RESPONSE
+            and radio._serial_identity_reread_task is not None
+        )
+
+    # The one-shot error abandons the hold; the watchdog must reopen once
+    # and re-gate into a fresh no_response hold with a new re-read task.
+    assert await _wait_until(_re_gated_hold, timeout_s=3.0)
+
+    # Steady state: the new re-read owns the reopened link — no latch
+    # and no further reopen.
+    deadline = asyncio.get_running_loop().time() + 0.8
+    while asyncio.get_running_loop().time() < deadline:
+        assert radio.conn_state is not RadioConnectionState.CONNECTED
+        assert link.connect_calls == 2
+        await asyncio.sleep(0.02)
+    identity = radio.connection_identity
+    assert identity is not None and identity.status is RadioIdentityStatus.NO_RESPONSE
+    await radio.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_connect_during_hold_with_dead_session_cancels_reread_before_reopen() -> (
+    None
+):
+    """Round 4 (d): connect() cancels a live re-read before the reopen.
+
+    No two readers may ever send ``19 00`` on the new transport. The
+    counting wrapper fails the test the moment two identity reads
+    overlap; the old re-read's backoff slot is aimed inside the new
+    gate's (deliberately long) answer window to catch a missing cancel.
+    """
+    link = _GateSerialLink(answer_identity=False)
+    radio = _gate_radio(link)
+    # A long answer window so the new gate's read is still awaiting when
+    # the old re-read's backoff fires.
+    radio._civ_get_timeout = 0.5
+    radio._SERIAL_IDENTITY_REREAD_BACKOFF_S = (0.1, 0.1, 0.1)
+
+    real_read = radio._read_serial_identity_payload
+    active_reads = 0
+    max_active_reads = 0
+
+    async def _counting_read() -> bytes | None:
+        nonlocal active_reads, max_active_reads
+        active_reads += 1
+        max_active_reads = max(max_active_reads, active_reads)
+        try:
+            return await real_read()
+        finally:
+            active_reads -= 1
+
+    radio._read_serial_identity_payload = _counting_read  # type: ignore[assignment]
+
+    await radio.connect()  # held on silence; the re-read sleeps 0.1 s
+    old_reread = radio._serial_identity_reread_task
+    assert old_reread is not None
+
+    # The session dies under the hold and the radio comes back
+    # answering from query 3 (the new gate's query 2 stays silent, so
+    # its window covers the old re-read's wake-up).
+    link.connected = False
+    link.ready = False
+    link.policy_answer = True
+    link.answer_after_queries = 2
+
+    await asyncio.wait_for(radio.connect(), timeout=3.0)
+
+    # Give the old backoff slot every chance to fire on the new link.
+    await asyncio.sleep(0.3)
+    assert max_active_reads == 1  # never two readers on the new transport
+    await radio.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_reread_arm_failure_keeps_connected_identity_and_logs(
+    tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Round 4 (b): an arm failure after the answer keeps the latch.
+
+    ``connect()`` lets an ``_arm_managed_tx`` failure propagate to its
+    caller only AFTER the latch — the connection and the identity
+    survive it. The re-read has no caller to raise to: the same failure
+    is logged with the full traceback and the latch stands.
+    """
+    import logging
+
+    link = _GateSerialLink(answer_identity=True, answer_after_queries=1)
+    radio = _gate_radio(link)
+    composition = ManagedTxComposition(radio, config_path=tmp_path / "managed-tx.json")
+    install_managed_tx_composition(radio, composition)
+
+    async def _exploding_arm() -> None:
+        raise RuntimeError("managed TX arm exploded")
+
+    radio._arm_managed_tx = _exploding_arm  # type: ignore[assignment]
+
+    await radio.connect()  # held on silence; the re-read gets the answer
+    with caplog.at_level(logging.ERROR, logger="rigplane.backends._icom_serial_base"):
+        assert await _wait_until(
+            lambda: radio.conn_state is RadioConnectionState.CONNECTED,
+            timeout_s=3.0,
+        )
+        await asyncio.sleep(0.1)  # the arm failure lands right after the latch
+
+    identity = radio.connection_identity
+    assert identity is not None
+    assert identity.status is RadioIdentityStatus.UNVERIFIED
+    assert identity.answered_id == "94"
+    assert radio.connected is True
+    assert radio._serial_identity_reread_task is None
+    assert any(
+        "managed TX arming failed" in r.getMessage() and r.exc_info
+        for r in caplog.records
+    )
+    await radio.disconnect()
+    await composition.shutdown(asyncio.Event())
+
+
+# ---------------------------------------------------------------------------
+# MOR-3071 round 5: the initial gate must not escape or wedge. A write
+# error on an OPENED port converts to rigplane's ConnectionError, never
+# leaves CONNECTING, and the session still enters so the web serves.
+# ---------------------------------------------------------------------------
+
+
+class _BrokenWriteLink(_GateSerialLink):
+    """Port opens, writes fail — until the test relents (the ``fail_sends``
+    reset of ``connect`` is skipped, so the failure survives reopens)."""
+
+    async def connect(self) -> None:
+        await _FakeSerialCivLink.connect(self)
+
+
+@pytest.mark.asyncio
+async def test_gate_write_error_connect_recovers_serves_and_heals(tmp_path) -> None:
+    """Round 5 (a): the gate's OSError converts, the CLI session enters,
+    the web serves, and the watchdog heals once the fake stops failing."""
+    from rigplane.cli import _ManagedTxRadioSession
+
+    link = _BrokenWriteLink()
+    link.fail_sends = True
+    radio = _gate_radio(link)
+    composition = ManagedTxComposition(radio, config_path=tmp_path / "managed-tx.json")
+    install_managed_tx_composition(radio, composition)
+
+    with pytest.raises(ConnectionError) as exc_info:
+        await radio.connect()
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert radio.conn_state is RadioConnectionState.DISCONNECTED
+
+    entered = await _ManagedTxRadioSession(radio, composition).__aenter__()
+    assert entered is radio
+    assert radio.conn_state is RadioConnectionState.RECONNECTING
+
+    server = WebServer(radio, WebConfig(host="127.0.0.1", port=0))  # type: ignore[arg-type]
+    writer = _Writer()
+    await server._handle_http(writer, "GET", "/api/v1/info", headers={})  # noqa: SLF001
+    body = json.loads(writer.buffer.decode("ascii", "replace").split("\r\n\r\n", 1)[1])
+    connection = body["connection"]
+    assert connection["rigConnected"] is False
+    assert connection["identity"]["status"] == "checking"
+
+    link.fail_sends = False
+    assert await _wait_until(lambda: radio.connected, timeout_s=3.0)
+    identity = radio.connection_identity
+    assert identity is not None and identity.status is RadioIdentityStatus.UNVERIFIED
+    await radio.disconnect()
+    await composition.shutdown(asyncio.Event())
+
+
+@pytest.mark.asyncio
+async def test_gate_write_error_in_soft_reconnect_keeps_recovering() -> None:
+    """Round 5 (b): soft_reconnect() converts the same error and keeps
+    RECONNECTING — the state the watchdog retries from."""
+    link = _BrokenWriteLink()
+    radio = _gate_radio(link)
+    await radio.connect()
+    await radio._stop_civ_data_watchdog()
+
+    link.fail_sends = True
+    link.ready = False
+    link.healthy = False
+    with pytest.raises(ConnectionError) as exc_info:
+        await radio.soft_reconnect()
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert radio.conn_state is RadioConnectionState.RECONNECTING
+
+    radio.start_reconnect_recovery()
+    link.fail_sends = False
+    assert await _wait_until(lambda: radio.connected, timeout_s=3.0)
+    identity = radio.connection_identity
+    assert identity is not None and identity.status is RadioIdentityStatus.UNVERIFIED
+    await radio.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_connect_guard_agrees_with_watchdog_guard() -> None:
+    """Round 5, finding 2: connect() and the watchdog share ONE hold
+    predicate — a hold on a connected-but-not-ready link owns nothing,
+    so connect() re-gates instead of returning into it."""
+    link = _GateSerialLink(answer_identity=False)
+    radio = _gate_radio(link)
+    await radio.connect()  # held on silence; the re-read owns the open link
+    radio._SERIAL_IDENTITY_REREAD_BACKOFF_S = (10.0,)
+    radio._SERIAL_IDENTITY_REREAD_STEADY_S = 10.0
+    assert radio._serial_identity_reread_task is not None
+
+    # The replug shape: still connected, not ready, answering again.
+    link.policy_answer = True
+    link.ready = False
+    link.healthy = False
+
+    await radio.connect()
+
+    assert radio.conn_state is RadioConnectionState.CONNECTED
+    identity = radio.connection_identity
+    assert identity is not None and identity.status is RadioIdentityStatus.UNVERIFIED
+    assert link.connect_calls == 1  # the open link was reused, not reopened
+    assert radio._serial_identity_reread_task is None
+    await radio.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# Ticket tests 6-7: /api/v1/info connection.identity
+# ---------------------------------------------------------------------------
+
+
+class _Writer:
+    def __init__(self) -> None:
+        self.buffer = bytearray()
+
+    def write(self, data: bytes) -> None:
+        self.buffer.extend(data)
+
+    async def drain(self) -> None:
+        return None
+
+
+def _identity_radio(
+    identity: object, *, connected: bool, ready: bool
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        model="IC-7300",
+        connected=connected,
+        control_connected=connected,
+        radio_ready=ready,
+        capabilities=frozenset(),
+        connection_identity=identity,
+    )
+
+
+@pytest.mark.asyncio
+async def test_info_connection_identity_for_each_status() -> None:
+    """Ticket test 6: identity per status; false rigConnected/radioReady when held."""
+    cases = [
+        (
+            RadioIdentity(
+                status=RadioIdentityStatus.CHECKING, expected_model="IC-7300"
+            ),
+            False,
+        ),
+        (
+            RadioIdentity(
+                status=RadioIdentityStatus.NO_RESPONSE, expected_model="IC-7300"
+            ),
+            False,
+        ),
+        (
+            RadioIdentity(
+                status=RadioIdentityStatus.UNVERIFIED,
+                expected_model="IC-7300",
+                answered_id="94",
+            ),
+            True,
+        ),
+    ]
+    for identity, connected in cases:
+        radio = _identity_radio(identity, connected=connected, ready=connected)
+        server = WebServer(radio, WebConfig(host="127.0.0.1", port=0))  # type: ignore[arg-type]
+        writer = _Writer()
+        await server._handle_http(writer, "GET", "/api/v1/info", headers={})  # noqa: SLF001
+        text = writer.buffer.decode("ascii", errors="replace")
+        status_code = int(text.split(" ", 2)[1])
+        body_start = text.index("\r\n\r\n") + 4
+        payload = json.loads(text[body_start:] or "{}")
+        assert status_code == 200
+        connection = payload["connection"]
+        assert connection["rigConnected"] is connected
+        assert connection["radioReady"] is connected
+        assert connection["identity"] == {
+            "status": identity.status.value,
+            "expectedModel": "IC-7300",
+            "answeredModel": None,
+            "answeredId": identity.answered_id,
+        }
+
+    # Identity null when the link never opened (no identity at all).
+    radio = _identity_radio(None, connected=False, ready=False)
+    server = WebServer(radio, WebConfig(host="127.0.0.1", port=0))  # type: ignore[arg-type]
+    writer = _Writer()
+    await server._handle_http(writer, "GET", "/api/v1/info", headers={})  # noqa: SLF001
+    text = writer.buffer.decode("ascii", errors="replace")
+    body_start = text.index("\r\n\r\n") + 4
+    payload = json.loads(text[body_start:] or "{}")
+    assert "identity" in payload["connection"]
+    assert payload["connection"]["identity"] is None
+
+
+@pytest.mark.asyncio
+async def test_info_connection_identity_keys_are_pinned() -> None:
+    """Ticket test 7: contract pin of the connection.identity keys."""
+    identity = RadioIdentity(
+        status=RadioIdentityStatus.IDENTITY_MISMATCH,
+        expected_model="IC-7300",
+        answered_model="FTX-1",
+        answered_id="0840",
+    )
+    radio = _identity_radio(identity, connected=False, ready=False)
+    server = WebServer(radio, WebConfig(host="127.0.0.1", port=0))  # type: ignore[arg-type]
+    writer = _Writer()
+    await server._handle_http(writer, "GET", "/api/v1/info", headers={})  # noqa: SLF001
+    text = writer.buffer.decode("ascii", errors="replace")
+    body_start = text.index("\r\n\r\n") + 4
+    payload = json.loads(text[body_start:] or "{}")
+    served = payload["connection"]["identity"]
+    assert set(served) == {"status", "expectedModel", "answeredModel", "answeredId"}
+    assert served["status"] in {
+        "checking",
+        "verified",
+        "identity_mismatch",
+        "no_response",
+        "unverified",
+    }
+
+
+@pytest.mark.asyncio
+async def test_startup_gate_releases_at_once_while_identity_is_no_response(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Behaviour 9: the web startup gate does not wait out the timeouts."""
+    import logging
+
+    path = FieldPath.global_("tx_state", "ptt")
+    scheduler = AcquisitionScheduler(
+        profile=RadioAcquisitionProfile(
+            provider="test_provider",
+            capabilities=(FieldCapability(path=path, polling=True),),
+            field_policies={
+                path: AcquisitionPolicy(cadence_seconds=1.0, freshness_ttl_seconds=15.0)
+            },
+        )
+    )
+    radio = SimpleNamespace(
+        connection_identity=RadioIdentity(
+            status=RadioIdentityStatus.NO_RESPONSE, expected_model="IC-7300"
+        ),
+        capabilities=frozenset(),
+        _acquisition_scheduler=scheduler,
+    )
+    server = WebServer(  # type: ignore[arg-type]
+        radio,
+        WebConfig(host="127.0.0.1", port=0, await_initial_state=True),
+    )
+    assert scheduler.unobserved_startup_paths(()) == (path,)
+
+    with caplog.at_level(logging.WARNING, logger="rigplane.web.web_startup"):
+        # Must return at once instead of waiting out the acquisition
+        # timeout on a connect that has not completed.
+        await asyncio.wait_for(
+            _await_initial_state_acquisition(server, sweep=False), timeout=1.0
+        )
+
+    assert scheduler.startup_defect is None
+    assert server._served_with_silent_link is True
+    warnings = [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.WARNING and "identity" in record.getMessage()
+    ]
+    assert len(warnings) == 1
