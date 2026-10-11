@@ -12,6 +12,21 @@ UDP code paths as production.
   fault injection (drop, reorder, stall, delay). The implementation lives in
   `rigplane_testkit/icom/simulator.py` and was moved unchanged from
   `tests/mock_server.py`.
+- `rigplane_testkit.icom.faults` — `FaultPlan` / `FaultRule`: a declarative,
+  seeded (deterministic) fault plan with one rule per port (`control`, `civ`)
+  and direction (`to_client`, `from_client`). Each rule can drop (probability
+  or every-Nth), duplicate (with inter-copy delay), delay (fixed + jitter),
+  reorder (window), corrupt (bit-flip N bytes) and truncate (to K bytes), and
+  can be bounded by packet count or duration (e.g. "lose the next 5 control
+  packets"). Reorder buffers always flush — on a full window, on a
+  `reorder_flush_s` deadline (driven by the simulator when the stream goes
+  idle), and when a bound deactivates the rule — so no packet is ever held
+  forever. Each stream draws from its own RNG derived from the plan seed
+  (`f"{seed}:{port}:{direction}"`), so one stream's traffic cannot change
+  another stream's decisions. The plan sits beside the legacy knobs
+  (`drop_rate`, `reorder_window`, `response_delay`, `stall_for`), which are
+  unchanged.
+  Wire-level examples live in `tests/testkit/test_simulator_faults.py`.
 - `rigplane_testkit.serial` — `CivSerialFake`, a stateful IC-7300 personality
   on an in-memory serial duplex (frequency, mode, filter, PTT, S-meter,
   profile-derived identity, USB CI-V echo). It mounts behind the production
@@ -56,7 +71,6 @@ the legacy compatibility shim. It exists for development and testing only.
 ## Planned next
 
 - Audio (RTP) port simulation alongside control and CI-V ports.
-- A per-port `FaultPlan` so fault schedules are declarative and composable.
 - Wiring the replayer into the simulator so recorded sessions answer through
   the same simulator surface (the recorder and the pure `ReplayResponder`
   are in place; the simulator mount is a separate task).
