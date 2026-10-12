@@ -5,6 +5,9 @@ import viteConfig from './vite.config'
 // Test set for the Stryker run (stryker.config.mjs). Replaces the repo's
 // two-project `test` block with the test files covering the mutated
 // modules, so each mutant runs these files instead of the whole suite.
+// panel-props.no-fabricated-defaults.test.ts is deliberately excluded: it
+// reads panel-props.ts as text (readFileSync), which under --inPlace is
+// the instrumented source.
 export default defineConfig({
   ...viteConfig,
   test: {
@@ -13,6 +16,9 @@ export default defineConfig({
     include: [
       'src/lib/runtime/adapters/__tests__/radio-view-model-adapter.test.ts',
       'src/semantic/__tests__/radio-view-model.test.ts',
+      'src/lib/runtime/props/__tests__/panel-props.test.ts',
+      'src/lib/runtime/props/__tests__/notch-freq-domain.isolated.test.ts',
+      'src/lib/runtime/props/__tests__/nr-level-projection.isolated.test.ts',
       'src/lib/runtime/adapters/__tests__/mod-input-auto.isolated.test.ts',
       'src/lib/runtime/adapters/__tests__/mod-input-tx-guard.isolated.test.ts',
     ],
