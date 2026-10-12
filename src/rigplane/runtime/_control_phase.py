@@ -792,10 +792,20 @@ class ControlPhaseRuntime:
                 # Defensive: _force_cleanup_civ normally nulls the transport.
                 # If a subclass/mock left it set, do not loop forever — bail.
                 return
-        if not h._ctrl_transport or not getattr(
-            h._ctrl_transport, "_udp_transport", None
+        # A control transport that ``_connect_once`` never marked CONNECTED is
+        # no session to reuse: ``IcomTransport.connect``/``reconnect`` leave it
+        # CONNECTING, so an open UDP socket alone must not select the
+        # CI-V-rebuild branch.  Transport doubles without a ``state`` attribute
+        # keep the pre-gate behaviour.
+        if (
+            not h._ctrl_transport
+            or not getattr(h._ctrl_transport, "_udp_transport", None)
+            or getattr(h._ctrl_transport, "state", ConnectionState.CONNECTED)
+            is not ConnectionState.CONNECTED
         ):
-            logger.info("soft_reconnect: control transport gone, doing full connect")
+            logger.info(
+                "soft_reconnect: control session not established, doing full connect"
+            )
             # The legacy ``connect()`` retry wrapper was removed in A3; the
             # lifecycle owns retry.  A full re-establish here is a single
             # mechanism attempt (``_connect_once``); the lifecycle's RECOVERING
@@ -811,6 +821,11 @@ class ControlPhaseRuntime:
                     await teardown_audio()
                 except Exception:
                     logger.debug("soft_reconnect: audio teardown failed", exc_info=True)
+            if getattr(h._ctrl_transport, "_udp_transport", None) is not None:
+                # Open but not CONNECTED: ``_connect_once`` opens a new
+                # endpoint on this transport without closing this one.
+                with _suppress(Exception):
+                    await h._ctrl_transport.disconnect()
             await self._connect_once()
             identity_epoch = getattr(h, "_lan_identity_owned_epoch", None)
             await self._after_reconnect(
