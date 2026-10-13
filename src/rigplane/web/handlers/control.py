@@ -1106,6 +1106,24 @@ class ControlHandler:
         else:
             logger.debug("control: unknown message type: %r", msg_type)
 
+    def _note_operator_disconnect(self) -> None:
+        """Mark an intentional operator disconnect on the server (MOR-3452).
+
+        Defensive ``getattr``: unit doubles attach a bare namespace as
+        the server, the way the provider-epoch invalidation above does.
+        """
+
+        note = getattr(self._server, "note_operator_disconnect", None)
+        if callable(note):
+            note()
+
+    def _note_operator_connect(self) -> None:
+        """Clear the operator-disconnect mark on the server (MOR-3452)."""
+
+        note = getattr(self._server, "note_operator_connect", None)
+        if callable(note):
+            note()
+
     async def _handle_radio_connect(self, msg: dict[str, Any]) -> None:
         """Handle radio_connect request — reconnect the radio."""
         logger.info("radio_connect requested")
@@ -1134,6 +1152,10 @@ class ControlHandler:
             return
         try:
             if self._radio.connected:
+                # MOR-3452: the operator asked back in — clear the mark
+                # when the connect starts; the stale mark must not survive
+                # even this no-op path.
+                self._note_operator_connect()
                 await self._send_json(
                     {
                         "type": "response",
@@ -1143,6 +1165,10 @@ class ControlHandler:
                     }
                 )
                 return
+            # MOR-3452: clear the disconnect mark when the connect starts,
+            # before any await, so an in-flight or failed connect never
+            # reads as an operator disconnect.
+            self._note_operator_connect()
             from ...radio_protocol import RecoverableConnection
 
             if isinstance(self._radio, RecoverableConnection):
@@ -1220,6 +1246,8 @@ class ControlHandler:
                 begin_generation = getattr(store, "begin_provider_generation", None)
                 if callable(begin_generation):
                     begin_generation()
+                # MOR-3452: mark the intentional disconnect for the runtime.
+                self._note_operator_disconnect()
                 await self._send_json(
                     {
                         "type": "response",
@@ -1236,6 +1264,8 @@ class ControlHandler:
                 await cast(RecoverableConnection, self._radio).soft_disconnect()
             else:
                 await self._radio.disconnect()
+            # MOR-3452: mark the intentional disconnect for the runtime.
+            self._note_operator_disconnect()
             await self._send_json(
                 {
                     "type": "response",
