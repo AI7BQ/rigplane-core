@@ -805,12 +805,12 @@ describe('ScopeController', () => {
     const handle = await controller.hardwareScopeDriver.start();
     local._setState('connected');
     local._fire(makeScopeFrameBuffer());
-    const oldTimer = timed.ids()[0];
+    const oldTimers = timed.ids();
     timed.advance(100);
     local._fire(makeScopeFrameBuffer());
     const newer = controller.snapshotFrameEvidence().envelope;
 
-    timed.fireEvenIfCancelled(oldTimer);
+    for (const timer of oldTimers) timed.fireEvenIfCancelled(timer);
     expect(controller.snapshotFrameEvidence().envelope).toBe(newer);
     expect(controller.snapshotHealth('hardware').frameSeen).toBe(true);
     expect(newer?.acceptedSequence).toBe(2);
@@ -847,6 +847,32 @@ describe('ScopeController', () => {
     await controller.hardwareScopeDriver.stop(handle);
     expect(controller.snapshotFrameEvidence().authority.demanded).toBe(false);
     expect(timed.activeCount()).toBe(0);
+  });
+
+  it.each([0, 1] as const)('retains receiver %s evidence while delivering the other receiver to raw subscribers', async receiver => {
+    const timed = makeTiming();
+    const local = makeMockChannel();
+    const controller = new ScopeController(() => local as any, timed.timing);
+    controller.setFrameAuthority({ source: 'hardware', receiver, providerGeneration: 5 });
+    const handle = await controller.hardwareScopeDriver.start();
+    local._setState('connected');
+    const raw = vi.fn();
+    const unsubscribe = controller.subscribeHardware(raw);
+    const selected = makeScopeFrameBuffer();
+    new DataView(selected).setUint8(1, receiver);
+    const foreign = makeScopeFrameBuffer();
+    new DataView(foreign).setUint8(1, 1 - receiver);
+    local._fire(selected);
+    const retained = controller.snapshotFrameEvidence().envelope;
+    timed.advance(100);
+    local._fire(foreign);
+    expect(raw).toHaveBeenCalledTimes(2);
+    expect(controller.scopeFrame?.receiver).toBe(1 - receiver);
+    expect(controller.snapshotFrameEvidence().envelope).toBe(retained);
+    local._fire(selected);
+    expect(controller.snapshotFrameEvidence().envelope?.acceptedSequence).toBe(3);
+    unsubscribe();
+    await controller.hardwareScopeDriver.stop(handle);
   });
 
   it('rejects mismatched receivers and old provider callbacks without reviving or clearing current facts', async () => {
