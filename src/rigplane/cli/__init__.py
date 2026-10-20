@@ -1514,6 +1514,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Enable WSJT-X compatibility pre-warm on embedded rigctld",
     )
     web_p.add_argument(
+        "--log-level",
+        dest="log_level",
+        default=None,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Logging level for the web UI server (default: unset, ICOM_DEBUG applies)",
+    )
+    web_p.add_argument(
         "--auth-token",
         dest="auth_token",
         type=_reject_retired_auth_option,
@@ -4336,6 +4343,21 @@ def _print_startup_banner(
     print("\n".join(lines))
 
 
+def _apply_log_level(args: argparse.Namespace) -> None:
+    """Apply --log-level to the rigplane logger hierarchy (serve/web).
+
+    Only an explicitly requested level is applied: a missing (e.g.
+    station) or None (web default) value leaves the loggers untouched
+    so the root ICOM_DEBUG configuration stays effective.
+    """
+    import logging as _logging
+
+    log_level = getattr(args, "log_level", None)
+    if log_level is None:
+        return
+    _logging.getLogger("rigplane").setLevel(getattr(_logging, log_level))
+
+
 async def _cmd_serve(radio: Radio, args: argparse.Namespace) -> int:
     import logging as _logging
 
@@ -4343,9 +4365,7 @@ async def _cmd_serve(radio: Radio, args: argparse.Namespace) -> int:
     from rigplane.rigctld.contract import RigctldConfig
     from rigplane.rigctld.server import RigctldServer
 
-    # Apply requested log level to the rigplane logger hierarchy.
-    log_level = getattr(args, "log_level", "INFO")
-    _logging.getLogger("rigplane").setLevel(getattr(_logging, log_level))
+    _apply_log_level(args)
 
     # Configure JSON audit log if a path was provided.
     audit_log_path: str | None = getattr(args, "audit_log", None)
@@ -4429,6 +4449,8 @@ async def _cmd_web(
     import pathlib
 
     from rigplane.web.server import WebConfig, WebServer
+
+    _apply_log_level(args)
 
     static_dir = pathlib.Path(args.web_static_dir) if args.web_static_dir else None
     if static_dir is not None and not static_dir.is_dir():
