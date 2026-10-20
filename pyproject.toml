@@ -251,6 +251,8 @@ only_mutate = [
     "src/rigplane/core/tx_target.py",
     "src/rigplane/core/tx_observation.py",
     "src/rigplane/runtime/managed_tx_fence.py",
+    "src/rigplane/runtime/managed_tx_state.py",
+    "src/rigplane/web/handlers/rigctl.py",
     "src/rigplane/backends/yaesu_cat/parser.py",
     "src/rigplane/rigctld/routing.py",
 ]
@@ -259,7 +261,7 @@ only_mutate = [
 # the mutated modules: the import closure (~84 files) makes popular
 # functions inherit hundreds of slow integration tests and pushed
 # per-mutant runs past a minute, while this list keeps the full
-# 15-module sweep near an estimated fifteen minutes (from a 590 s
+# baseline fifteen-module sweep near an estimated fifteen minutes (from a 590 s
 # bounded window on the builder's Linux test host, not the CI runner;
 # see docs/development/mutation-testing.md). Source-introspection tests
 # (census/inventory scans such as tests/test_command_map_parity.py)
@@ -274,11 +276,14 @@ pytest_add_cli_args_test_selection = [
     "tests/test_civ_rx_coverage.py",
     "tests/test_combined_acquisition_drain.py",
     "tests/test_controller_authority.py",
+    "tests/test_controller_sessions.py",
     "tests/test_delta_encoder.py",
     "tests/test_managed_tx_fence.py",
+    "tests/test_managed_tx_state.py",
     "tests/test_pcm_ingress_decode.py",
     "tests/test_raw_civ_transaction.py",
     "tests/test_response_shape_from_profile.py",
+    "tests/test_rigctl_ws_channel.py",
     "tests/test_rigctld_protocol.py",
     "tests/test_rigctld_routable_extension.py",
     "tests/test_single_rx_plain_routing.py",
