@@ -76,7 +76,6 @@ from rigplane.core.capabilities import (  # noqa: E402
     CAP_ANTENNA,
     CAP_ATTENUATOR,
     CAP_AUDIO,
-    CAP_CW,
     CAP_DUAL_WATCH,
     CAP_METERS,
     CAP_POWER_CONTROL,
@@ -2514,9 +2513,14 @@ async def _run(args: argparse.Namespace) -> int:
     if preset:
         _apply_preset(args, preset)
 
+    from rigplane.rig_loader import RigLoadError
+
     try:
         config = await _build_backend_config(args)
-    except ValueError as exc:
+    except (ValueError, RigLoadError) as exc:
+        # --model resolves through the rig profiles; one that does not load
+        # (MOR-3678: e.g. an incomplete [cw_text] enable) is a readable
+        # error naming the file and key, like the create_radio() path.
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     # web, serve and station run for the life of the process on one radio, so
@@ -2577,7 +2581,9 @@ async def _run(args: argparse.Namespace) -> int:
         return await _cmd_audio_probe(config, args)
     try:
         radio = create_radio(config)
-    except ValueError as exc:
+    except (ValueError, RigLoadError) as exc:
+        # A profile that does not load (MOR-3678: e.g. an incomplete
+        # [cw_text] enable) is a readable error naming the file and key.
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
@@ -2692,12 +2698,9 @@ async def _run(args: argparse.Namespace) -> int:
             elif args.command == "ptt":
                 return await _cmd_ptt(radio, args)
             elif args.command == "cw":
-                if CAP_CW not in radio.capabilities:
-                    print(
-                        "Error: this radio does not support CW control.",
-                        file=sys.stderr,
-                    )
-                    return 1
+                # MOR-3678: send_cw_text's own admission (the profile's
+                # cw_text) decides, the same check HTTP and WebSocket use;
+                # the cw tag is not a second gate.
                 return await _cmd_cw(radio, args)
             elif args.command == "att":
                 if CAP_ATTENUATOR not in radio.capabilities:
@@ -2973,6 +2976,7 @@ async def _cmd_audio_caps(
 
 async def _cmd_audio_probe(config: BackendConfig, args: argparse.Namespace) -> int:
     """Run a safe RX-only LAN audio capability probe."""
+    from rigplane.rig_loader import RigLoadError
 
     if not isinstance(config, LanBackendConfig):
         print("Error: audio probe requires a LAN backend.", file=sys.stderr)
@@ -2983,7 +2987,8 @@ async def _cmd_audio_probe(config: BackendConfig, args: argparse.Namespace) -> i
             model=config.model,
             radio_addr=config.radio_addr,
         )
-    except ValueError as exc:
+    except (ValueError, RigLoadError) as exc:
+        # MOR-3678: an unloadable rig profile is a readable error here too.
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     duration_s = float(getattr(args, "duration", 1.0))
@@ -3843,7 +3848,15 @@ async def _cmd_ptt(radio: Radio, args: argparse.Namespace) -> int:
 
 
 async def _cmd_cw(radio: Radio, args: argparse.Namespace) -> int:
-    await radio.send_cw_text(args.text)
+    # MOR-3678: same refusal text as HTTP/WebSocket for a backend with no
+    # send_cw_text (external rigctld); the profile admission decides otherwise.
+    from rigplane.profiles import cw_text_sender
+
+    send_cw_text = cw_text_sender(radio)
+    if send_cw_text is None:
+        print("Error: radio does not support this command", file=sys.stderr)
+        return 1
+    await send_cw_text(args.text)
     print(f"CW: {args.text}")
     return 0
 

@@ -208,6 +208,7 @@ RESPONSE_FIELD_CONTRACTS: Final[dict[str, ResponseFieldContract]] = {
             "filters",
             "audioConfig",
             "webrtc",
+            "cwText",
         )
     },
     "/api/v1/managed-transmit": {
