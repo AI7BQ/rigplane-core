@@ -16,6 +16,9 @@ from pathlib import Path
 
 from rigplane.profiles.rig_loader import load_rig
 
+from rigplane_testkit.sim.adapters.yaesu_cat import (
+    unledgered_divergences,
+)
 from rigplane_testkit.sim.engine import ManualClock
 from rigplane_testkit.sim.model.yaesu_cat import (
     NATIVE_READS,
@@ -59,26 +62,14 @@ def _seeded_model(table: RecordedCatAnswerTable) -> YaesuCatModel:
 
 def test_model_diverges_from_the_recording_only_where_the_ledger_says() -> None:
     table = _table()
-    model = _seeded_model(table)
-    live: dict[str, dict[str, str | None]] = {}
-    for request in table.requests():
-        recorded = table.lookup(request)
-        assert recorded is not None
-        got = model.handle(request)
-        if got != recorded.reply:
-            live[request] = {"recorded": recorded.reply, "model": got}
     ledger = json.loads(LEDGER.read_text())
-    new = {k: v for k, v in live.items() if k not in ledger}
-    stale = sorted(k for k in ledger if k not in live)
-    assert not new, (
-        f"divergences missing from the ledger (fix the model or list them): {new}"
+    mismatches = unledgered_divergences(_seeded_model, table, LEDGER)
+    assert not mismatches, (
+        "model/ledger mismatches (fix or ledger live divergences; "
+        f"delete stale entries marked None): {mismatches}"
     )
-    assert not stale, f"ledger entries that no longer diverge (delete them): {stale}"
     for request, entry in ledger.items():
         assert entry.get("ticket") and entry.get("why"), request
-        assert {k: live[request][k] for k in ("recorded", "model")} == {
-            k: entry[k] for k in ("recorded", "model")
-        }, request
 
 
 def test_every_native_read_is_recorded_as_data() -> None:
