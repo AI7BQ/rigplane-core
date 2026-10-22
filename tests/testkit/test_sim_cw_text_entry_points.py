@@ -23,13 +23,14 @@ import asyncio
 import json
 import re
 import struct
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+import rigplane.cli as rigplane_cli
 from rigplane.backends.yaesu_cat.radio import YaesuCatRadio
 from rigplane.cli import (
     _build_parser,
@@ -60,6 +61,8 @@ ENABLED = "[cw_text]\nsupported = true\nmax_length = 50\nmemory_channel = 5"
 DISABLED = "[cw_text]\nsupported = false\nmax_length = 50\nmemory_channel = 5"
 TOO_LONG = "CW text too long for FTX-1: got 51 characters, limit is 50"
 UNSUPPORTED = "FTX-1 does not support sending CW text yet"
+STOPPED = "CW text send to FTX-1 was cancelled by a CW stop"
+ABORTED = "CW text send to FTX-1 was cancelled by a transmit abort"
 
 
 def _rigs_dir(tmp_path: Path, cw_text: str, *, cw_tag: bool) -> Path:
@@ -410,13 +413,67 @@ class _HoldingWire:
             radio_writer.close()
 
 
+class _RejectingKmWire(_HoldingWire):
+    """A serial line whose radio answers ``?;`` to a ``KM`` write.
+
+    Fake hardware only. Once :attr:`armed`, a ``KM`` line from the radio
+    object is not passed on (the simulated radio stores nothing); the wire
+    first calls :attr:`on_km` (if set), lets the loop run once, then
+    answers ``?;``, which the transport reads while it drains after the
+    write (CAT general rules, printed p.4: ``?;`` is the radio's refusal).
+    """
+
+    def __init__(self, device: str) -> None:
+        super().__init__(device)
+        self.on_km: Callable[[], object] | None = None
+
+    async def _serve(
+        self, radio_reader: asyncio.StreamReader, radio_writer: asyncio.StreamWriter
+    ) -> None:
+        sim_reader, sim_writer = await asyncio.open_connection(*self._upstream)
+
+        async def to_sim() -> None:
+            pending = b""
+            while data := await radio_reader.read(4096):
+                pending += data
+                while b";" in pending:
+                    line, pending = pending.split(b";", 1)
+                    if self.armed and line.startswith(b"KM"):
+                        if self.on_km is not None:
+                            self.on_km()
+                        await asyncio.sleep(0)
+                        radio_writer.write(b"?;")
+                        await radio_writer.drain()
+                        continue
+                    sim_writer.write(line + b";")
+                    await sim_writer.drain()
+
+        async def to_radio() -> None:
+            while data := await sim_reader.read(4096):
+                radio_writer.write(data)
+                await radio_writer.drain()
+
+        for coro in (to_sim(), to_radio()):
+            task = asyncio.create_task(coro)
+            self._tasks.add(task)
+        try:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        finally:
+            sim_writer.close()
+            radio_writer.close()
+
+
 @asynccontextmanager
 async def _managed_web(
-    rigs: Path, tmp_path: Path, *, wire: bool = False
+    rigs: Path,
+    tmp_path: Path,
+    *,
+    wire: bool = False,
+    line_type: type[_HoldingWire] = _HoldingWire,
 ) -> AsyncIterator[SimpleNamespace]:
     """The composition order of ``rigplane web`` (cli/__init__.py: _run, _cmd_web)."""
     async with _sim() as sim, AsyncExitStack() as stack:
-        line = await stack.enter_async_context(_HoldingWire(sim.device))
+        line = await stack.enter_async_context(line_type(sim.device))
         radio = YaesuCatRadio(
             line.device if wire else sim.device, profile=load_rig(rigs / "ftx1.toml")
         )
@@ -522,15 +579,25 @@ async def test_cli_audio_probe_reports_an_unloadable_profile(
 # ── A stop ends sends that are still pending (not yet on the wire) ──
 
 _SEND = "/api/v1/radio/cw/send"
+_COMMANDS = "/api/v1/commands"
 
 
-async def _send_outcome(port: int, text: str) -> tuple[int | None, dict]:
-    """POST a CW text send; ``(None, {})`` when the server closes unanswered."""
+async def _send_outcome(
+    port: int, text: str, *, path: str = _SEND
+) -> tuple[int | None, dict]:
+    """POST a CW text send; ``(None, {})`` when the server closes unanswered.
+
+    *path* ``/api/v1/commands`` sends it as the structured
+    ``send_cw_text`` command instead of ``/api/v1/radio/cw/send``.
+    """
     reader, writer = await asyncio.open_connection("127.0.0.1", port)
     try:
-        data = json.dumps({"text": text}).encode()
+        body: dict[str, object] = {"text": text}
+        if path == _COMMANDS:
+            body = {"name": "send_cw_text", "params": body}
+        data = json.dumps(body).encode()
         writer.write(
-            f"POST {_SEND} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+            f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
             f"Content-Type: application/json\r\nContent-Length: {len(data)}\r\n"
             "Connection: close\r\n\r\n".encode()
             + data
@@ -545,13 +612,38 @@ async def _send_outcome(port: int, text: str) -> tuple[int | None, dict]:
     return int(head.split(b" ", 2)[1]), json.loads(body or b"{}")
 
 
-async def _pending_sends(s: SimpleNamespace) -> tuple[asyncio.Task, asyncio.Task]:
-    """Two HTTP sends left pending behind a held radio reply."""
+async def _ws_send_outcome(port: int, text: str) -> dict | None:
+    """A WebSocket ``send_cw_text``; ``None`` when no response ever comes."""
+    try:
+        return await asyncio.wait_for(
+            _ws_command(port, "send_cw_text", {"text": text}), 10
+        )
+    except (TimeoutError, asyncio.IncompleteReadError, ConnectionError, AssertionError):
+        return None
+
+
+async def _commands_send_outcome(port: int, text: str) -> tuple[int | None, dict]:
+    """``send_cw_text`` through the structured ``POST /api/v1/commands``."""
+    return await _send_outcome(port, text, path=_COMMANDS)
+
+
+_OUTCOME = {
+    "http": _send_outcome,
+    "commands": _commands_send_outcome,
+    "websocket": _ws_send_outcome,
+}
+
+
+async def _pending_sends(
+    s: SimpleNamespace, entry: str = "http"
+) -> tuple[asyncio.Task, asyncio.Task]:
+    """Two sends (HTTP or WebSocket) left pending behind a held radio reply."""
+    outcome = _OUTCOME[entry]
     s.wire.armed = True
     await asyncio.wait_for(s.wire.held.wait(), 5)
-    first = asyncio.create_task(_send_outcome(s.port, "AAA"))
+    first = asyncio.create_task(outcome(s.port, "AAA"))
     await asyncio.sleep(0.05)
-    second = asyncio.create_task(_send_outcome(s.port, "BBB"))
+    second = asyncio.create_task(outcome(s.port, "BBB"))
     await asyncio.sleep(0.05)
     # Observation only: the first send holds the send lock, KM not yet sent.
     assert s.radio._cw_text_lock.locked()  # noqa: SLF001
@@ -560,44 +652,67 @@ async def _pending_sends(s: SimpleNamespace) -> tuple[asyncio.Task, asyncio.Task
     return first, second
 
 
-def _assert_ended_unsent(result: tuple[int | None, dict], how: str) -> None:
-    status, body = result
+def _ended_unsent(entry: str, how: str, message: str | None = None) -> object:
+    """What the user sees for a send a stop or force-off ended (MOR-3700).
+
+    A defined refusal on every entry point: HTTP 409 ``command_cancelled``
+    (``/api/v1/radio/cw/send`` and the structured ``/api/v1/commands``,
+    each in its own envelope), WebSocket ``ok: false`` with the same code
+    and text. It used to be a 500
+    ("Managed Yaesu CAT write is no longer current") for a stop and, for a
+    force-off, a connection closed with no response at all.
+    """
+    if message is None:
+        message = STOPPED if how == "stop" else ABORTED
+    if entry == "http":
+        return (409, {"error": "command_cancelled", "message": message})
+    if entry == "commands":
+        return (
+            409,
+            {"ok": False, "error": "command_cancelled", "message": message},
+        )
+    return {
+        "type": "response",
+        "id": "cw-1",
+        "ok": False,
+        "error": "command_cancelled",
+        "message": message,
+    }
+
+
+async def _end_pending_sends(s: SimpleNamespace, how: str) -> tuple[int, dict]:
+    """A CW stop or a managed force-off over HTTP while the sends wait."""
     if how == "stop":
-        # The stop ends the send; its write is refused as no longer current.
-        assert status is not None and status != 200, body
-        assert "no longer current" in body["error"], body
+        stop = asyncio.create_task(
+            _request(s.port, "POST", "/api/v1/radio/cw/stop", {})
+        )
     else:
-        # A force-off cancels the fenced TX work the send waits in; the
-        # request ends without a success response.
-        assert status != 200, body
+        stop = asyncio.create_task(
+            _request(
+                s.port,
+                "POST",
+                "/api/v1/managed-transmit/command",
+                {"operation": "force_off"},
+            )
+        )
+    await asyncio.sleep(0.05)
+    s.wire.release.set()
+    return await asyncio.wait_for(stop, 10)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["http", "commands", "websocket"])
 @pytest.mark.parametrize("how", ["stop", "force_off"])
 async def test_stop_ends_pending_sends_before_they_play(
-    tmp_path: Path, how: str
+    tmp_path: Path, how: str, entry: str
 ) -> None:
     rigs = _rigs_dir(tmp_path, ENABLED, cw_tag=True)
     async with _managed_web(rigs, tmp_path, wire=True) as s:
-        first, second = await _pending_sends(s)
-        if how == "stop":
-            stop = asyncio.create_task(
-                _request(s.port, "POST", "/api/v1/radio/cw/stop", {})
-            )
-        else:
-            stop = asyncio.create_task(
-                _request(
-                    s.port,
-                    "POST",
-                    "/api/v1/managed-transmit/command",
-                    {"operation": "force_off"},
-                )
-            )
-        await asyncio.sleep(0.05)
-        s.wire.release.set()
-        stopped = await asyncio.wait_for(stop, 10)
-        _assert_ended_unsent(await asyncio.wait_for(first, 10), how)
-        _assert_ended_unsent(await asyncio.wait_for(second, 10), how)
+        first, second = await _pending_sends(s, entry)
+        stopped = await _end_pending_sends(s, how)
+        expected = _ended_unsent(entry, how)
+        assert await asyncio.wait_for(first, 15) == expected
+        assert await asyncio.wait_for(second, 15) == expected
         assert stopped[0] in (200, 202), stopped
         await _settle()
         # Neither earlier send wrote its memory or played; only the stop.
@@ -607,6 +722,118 @@ async def test_stop_ends_pending_sends_before_they_play(
         # The radio still sends after the stop.
         status, body = await _request(s.port, "POST", _SEND, {"text": "CQ"})
         assert (status, body) == (200, {"text": "CQ"})
+
+
+def _km_rejected(entry: str) -> object:
+    """What a send whose KM the radio refuses with ``?;`` answers (unchanged)."""
+    message = "Radio rejected command 'KM5AAA;' (returned '?;')"
+    if entry == "http":
+        return (500, {"error": message})
+    if entry == "commands":
+        return (409, {"ok": False, "error": "radio_nak", "message": message})
+    return {
+        "type": "response",
+        "id": "cw-1",
+        "ok": False,
+        "error": "radio_nak",
+        "message": message,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["http", "commands", "websocket"])
+@pytest.mark.parametrize("stopped", [True, False], ids=["stopped", "current"])
+async def test_a_km_refused_after_a_stop_is_the_stop_refusal(
+    tmp_path: Path, entry: str, stopped: bool
+) -> None:
+    # MOR-3700 (pre-review round 2): KM passed its currency check and went
+    # out; a CW stop ends the send while the transport still drains after
+    # that write; then the radio answers ?;. The caller is told the stop
+    # ended the send. Without the stop, the refusal keeps its old answer.
+    rigs = _rigs_dir(tmp_path, ENABLED, cw_tag=True)
+    async with _managed_web(rigs, tmp_path, wire=True, line_type=_RejectingKmWire) as s:
+        assert isinstance(s.wire, _RejectingKmWire)
+        stops: list[asyncio.Task[None]] = []
+        if stopped:
+            # The production radio's public stop, started the moment KM
+            # reaches the line (an HTTP stop cannot be timed into the
+            # drain window from outside).
+            s.wire.on_km = lambda: stops.append(
+                asyncio.create_task(s.radio.stop_cw_text())
+            )
+        s.wire.armed = True
+        result = await asyncio.wait_for(_OUTCOME[entry](s.port, "AAA"), 15)
+        s.wire.armed = False
+        await asyncio.gather(*stops)
+        assert len(stops) == int(stopped)
+        if stopped:
+            assert result == _ended_unsent(entry, "stop")
+        else:
+            assert result == _km_rejected(entry)
+        await _settle()
+        assert s.model.keying_memory == {}
+        assert (0, 5) not in s.model.keyer_play_requests
+        assert s.sim.ptt is False
+
+
+@pytest.mark.asyncio
+async def test_cli_send_a_stop_ends_exits_1_with_the_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # MOR-3700: the CLI's half of the cancelled-send refusal. Real argv
+    # through _run and create_radio; the send waits behind a held radio
+    # reply (_HoldingWire, fake serial line) when a CW stop ends it. The CLI
+    # has no stop or managed force-off of its own while ``cw`` runs, so the
+    # stop is the production radio's public stop_cw_text, called on the
+    # radio the CLI built (captured, not replaced). It used to print the
+    # transport's "Managed Yaesu CAT write is no longer current."
+    rigs = _rigs_dir(tmp_path, ENABLED, cw_tag=True)
+    monkeypatch.setattr("rigplane.backends.yaesu_cat.radio._RIGS_DIR", rigs)
+    reached_send = asyncio.Event()
+    go = asyncio.Event()
+    built: list[YaesuCatRadio] = []
+    real_create_radio = rigplane_cli.create_radio
+
+    def capture_radio(config: object) -> object:
+        radio = real_create_radio(config)
+        assert isinstance(radio, YaesuCatRadio)
+        built.append(radio)
+        real_send = radio.send_cw_text
+
+        async def send_when_told(text: str) -> None:
+            # Synchronization only: the real send runs unchanged.
+            reached_send.set()
+            await go.wait()
+            await real_send(text)
+
+        radio.send_cw_text = send_when_told  # type: ignore[method-assign]
+        return radio
+
+    monkeypatch.setattr("rigplane.cli.create_radio", capture_radio)
+    async with _sim() as sim, _HoldingWire(sim.device) as wire:
+        cli = asyncio.create_task(_cli(wire.device, "cw", "AAA"))
+        await asyncio.wait_for(reached_send.wait(), 20)
+        (radio,) = built
+        wire.armed = True
+        query = asyncio.create_task(radio.get_freq())
+        await asyncio.wait_for(wire.held.wait(), 5)
+        go.set()
+        await asyncio.sleep(0.05)
+        assert not cli.done()
+        stop = asyncio.create_task(radio.stop_cw_text())
+        await asyncio.sleep(0.05)
+        wire.release.set()
+        assert await asyncio.wait_for(cli, 15) == 1
+        # The stop's own KY queues behind the send and may find the CLI
+        # already disconnected; only the send's outcome matters here.
+        await asyncio.gather(stop, query, return_exceptions=True)
+        await _settle()
+        assert sim.model.keying_memory == {}
+        assert (0, 5) not in sim.model.keyer_play_requests
+    err = capsys.readouterr().err
+    assert f"Error: {STOPPED}\n" in err, err
 
 
 # ── Text a CAT parameter cannot carry: refused alike, nothing written ──
