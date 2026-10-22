@@ -66,6 +66,7 @@ from rigplane.profiles import (
     FreqRangeInfo,
     KeyboardBinding,
     KeyboardConfig,
+    MemoryProfile,
     MeterCalibrationPoint,
     RadioProfile,
     RuleSpec,
@@ -733,6 +734,7 @@ class RigConfig:
     # top-level ``[identity].expected_ids``. Empty means no/unverified
     # identity configuration.
     expected_identity_ids: tuple[str, ...] = ()
+    memory: MemoryProfile | None = field(default=None, kw_only=True)
     # Optional ``[modes] families`` (MOR-3679): family name -> member mode
     # names from ``modes``, in declared order. Empty when not declared.
     # Keyword-only and appended so no positional argument shifts.
@@ -963,6 +965,7 @@ class RigConfig:
             state_acquisition=self.state_acquisition,
             tx_policy=self.tx_policy,
             expected_identity_ids=self.expected_identity_ids,
+            memory=self.memory,
             cw_text=self.cw_text,
         )
 
@@ -2146,6 +2149,54 @@ def _is_control_char(ch: str) -> bool:
     return code <= 0x1F or 0x7F <= code <= 0x9F
 
 
+_MEMORY_KEYS = frozenset(
+    {
+        "addressing",
+        "first_group",
+        "last_group",
+        "first_channel",
+        "last_channel",
+        "recall",
+    }
+)
+_MEMORY_ADDRESSING = frozenset({"group_channel", "band_channel"})
+
+
+def _parse_memory(filename: str, raw: Any) -> MemoryProfile | None:
+    """Parse the optional ``[memory]`` section (MOR-3627)."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise RigLoadError(f"{filename}: [memory] must be a table")
+    _reject_unknown_keys(filename, "[memory]", raw, _MEMORY_KEYS)
+    addressing = raw.get("addressing")
+    if not isinstance(addressing, str) or addressing not in _MEMORY_ADDRESSING:
+        raise RigLoadError(
+            f"{filename}: [memory].addressing must be one of "
+            f"{sorted(_MEMORY_ADDRESSING)}, got {addressing!r}"
+        )
+    bounds: dict[str, int] = {}
+    for key in ("first_group", "last_group", "first_channel", "last_channel"):
+        value = raw.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise RigLoadError(f"{filename}: [memory].{key} must be an integer")
+        if not 0 <= value <= 9999:
+            raise RigLoadError(f"{filename}: [memory].{key} must be 0..9999")
+        bounds[key] = value
+    if bounds["first_group"] > bounds["last_group"]:
+        raise RigLoadError(f"{filename}: [memory].first_group must be <= last_group")
+    if bounds["first_channel"] > bounds["last_channel"]:
+        raise RigLoadError(
+            f"{filename}: [memory].first_channel must be <= last_channel"
+        )
+    if addressing == "band_channel" and bounds["last_group"] > 99:
+        raise RigLoadError(f"{filename}: [memory] band codes are one BCD byte (0-99)")
+    recall = raw.get("recall", False)
+    if not isinstance(recall, bool):
+        raise RigLoadError(f"{filename}: [memory].recall must be a boolean")
+    return MemoryProfile(addressing=addressing, recall=recall, **bounds)  # type: ignore[arg-type]
+
+
 _CW_TEXT_KEYS = frozenset({"supported", "max_length", "memory_channel", "memory_type"})
 _CW_TEXT_MEMORY_TYPES = frozenset({"text", "message"})
 
@@ -3125,6 +3176,7 @@ def load_rig(path: Path) -> RigConfig:
     )
     tx_policy = _parse_tx_policy(filename, data.get("tx_policy"))
     expected_identity_ids = _parse_identity(filename, data.get("identity"))
+    memory = _parse_memory(filename, data.get("memory"))
     cw_text = _parse_cw_text(
         filename,
         data.get("cw_text"),
@@ -3239,6 +3291,7 @@ def load_rig(path: Path) -> RigConfig:
         state_acquisition=state_acquisition,
         tx_policy=tx_policy,
         expected_identity_ids=expected_identity_ids,
+        memory=memory,
         cw_text=cw_text,
     )
 

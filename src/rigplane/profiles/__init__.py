@@ -22,7 +22,7 @@ from rigplane.commands._codec import (
 from rigplane.commands.command_map import CommandMap, ReverseCommandIndex
 from rigplane.core.exceptions import CommandError
 from rigplane.core.state_acquisition_policy import RadioAcquisitionProfile
-from rigplane.core.types import ToneSquelchType
+from rigplane.core.types import MemoryProfile, ToneSquelchType
 
 __all__ = [
     "CwTextSendCancelledError",
@@ -44,6 +44,7 @@ __all__ = [
     "resolve_radio_profile",
     "KeyboardBinding",
     "KeyboardConfig",
+    "MemoryProfile",
 ]
 
 logger = logging.getLogger(__name__)
@@ -565,6 +566,10 @@ class RadioProfile:
     # unverified identity configuration; the loader validates shape only.
     # Appended to preserve the positional constructor contract.
     expected_identity_ids: tuple[str, ...] = ()
+    # Memory channel addressing from the optional ``[memory]`` section
+    # (MOR-3627); None when the profile declares none. Appended for the same
+    # reason as the fields above.
+    memory: MemoryProfile | None = field(default=None, kw_only=True)
     # ``[modes] families`` (MOR-3679): family name -> member modes, e.g.
     # ``{"cw": ("CW-U", "CW-L")}``. Empty when the profile declares none.
     # Keyword-only and appended so no positional argument shifts.
