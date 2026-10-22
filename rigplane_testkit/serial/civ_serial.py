@@ -43,6 +43,14 @@ table, then to a NAK. The echo default then comes from the table's ``echo``
 fact unless ``echo=`` is passed explicitly; without a table the default
 stays on.
 
+The CI-V USB baud rate is modelled on request (MOR-3620): ``answers_at_baud=N``
+hears only a connection at N baud (a radio fixed at that rate),
+``locks_to_first_baud=True`` follows the first frame's baud and ignores every
+other rate (``CI-V USB Baud Rate = Auto``, ``tests/fixtures/ic7300/evidence.json``).
+The connection baud comes from the opener's ``baudrate`` keyword and from
+``transport.serial.baudrate`` writes (``SerialCivLink.set_baudrate``); without
+either option the fake hears every rate and its writer has no ``transport``.
+
 Faults are scriptable and deterministic: ``delay_identity_answer``,
 ``answer_identity_after_reconnect_only``, ``wrong_model_id``, ``silence``
 (the MOR-2861 case: link open, nothing answers), ``usb_vanish`` /
@@ -110,7 +118,11 @@ class CivSerialFake:
         mode: int = 0x01,  # USB (§19 mode table)
         filter_width: int = 1,
         s_meter: int = 120,
+        answers_at_baud: int | None = None,
+        locks_to_first_baud: bool = False,
     ) -> None:
+        if answers_at_baud is not None and locks_to_first_baud:
+            raise ValueError("answers_at_baud and locks_to_first_baud are exclusive")
         profile = resolve_radio_profile(model=model)
         self._model = profile.model
         self._civ_addr = civ_addr if civ_addr is not None else profile.civ_addr
@@ -142,6 +154,10 @@ class CivSerialFake:
         self._model_id_override: bytes | None = None
         self._silent_until = 0.0
         self._vanished = False
+        self._answers_at_baud = answers_at_baud
+        self._locks_to_first_baud = locks_to_first_baud
+        self._locked_baud: int | None = None
+        self._frame_bauds: list[int | None] = []
 
         self._open_count = 0
         self._connections: list[_Connection] = []
@@ -196,6 +212,25 @@ class CivSerialFake:
     def open_count(self) -> int:
         """How many times the port has been (re)opened."""
         return self._open_count
+
+    @property
+    def models_baud(self) -> bool:
+        """Whether the radio hears only the baud it is fixed or locked to."""
+        return self._answers_at_baud is not None or self._locks_to_first_baud
+
+    @property
+    def locked_baud(self) -> int | None:
+        """The baud an Auto radio locked to, ``None`` before the first frame."""
+        return self._locked_baud
+
+    def power_cycle(self) -> None:
+        """Restart the radio: an Auto radio forgets the baud it locked to."""
+        self._locked_baud = None
+
+    @property
+    def frame_bauds(self) -> tuple[int | None, ...]:
+        """The connection baud of every inbound frame, in order."""
+        return tuple(self._frame_bauds)
 
     @property
     def commands(self) -> tuple[CivFrame, ...]:
@@ -270,9 +305,12 @@ class CivSerialFake:
     # Mounting seams
     # ------------------------------------------------------------------
 
-    async def open_serial_connection(self) -> tuple[asyncio.StreamReader, Any]:
-        """Zero-argument opener for ``SerialCivLink(open_serial_connection=...)``."""
-        return self._open()
+    async def open_serial_connection(
+        self, baudrate: int | None = None
+    ) -> tuple[asyncio.StreamReader, Any]:
+        """Opener for ``SerialCivLink(open_serial_connection=...)``; a test that
+        models the baud binds it with ``functools.partial(..., baudrate=N)``."""
+        return self._open(baudrate)
 
     async def opener(
         self,
@@ -282,14 +320,16 @@ class CivSerialFake:
         **kwargs: Any,
     ) -> tuple[asyncio.StreamReader, Any]:
         """``open_serial_port``-style opener (keyword ``url``/``baudrate``)."""
-        _ = (url, baudrate, kwargs)
-        return self._open()
+        _ = (url, kwargs)
+        return self._open(baudrate)
 
-    def _open(self) -> tuple[asyncio.StreamReader, "_FakeSerialWriter"]:
+    def _open(
+        self, baudrate: int | None = None
+    ) -> tuple[asyncio.StreamReader, "_FakeSerialWriter"]:
         if self._vanished:
             raise OSError(_VANISH_ERRNO, "CI-V fake: USB device is gone")
         self._open_count += 1
-        connection = _Connection(self, self._open_count)
+        connection = _Connection(self, self._open_count, baudrate)
         self._connections.append(connection)
         return connection.reader, connection.writer
 
@@ -297,7 +337,21 @@ class CivSerialFake:
     # Radio behaviour
     # ------------------------------------------------------------------
 
+    def _hears(self, connection: "_Connection") -> bool:
+        """Whether the radio's CI-V USB baud matches this connection's."""
+        baud = connection.baud
+        if baud is None:
+            return True  # the opener did not say: nothing to mismatch
+        if self._locks_to_first_baud:
+            if self._locked_baud is None:
+                self._locked_baud = baud
+            return baud == self._locked_baud
+        return self._answers_at_baud is None or baud == self._answers_at_baud
+
     def _on_wire_frame(self, connection: "_Connection", frame: bytes) -> None:
+        self._frame_bauds.append(connection.baud)
+        if not self._hears(connection):
+            return  # wrong baud: line noise to the radio, no answer, no echo
         if self._vanished or time.monotonic() < self._silent_until:
             return  # silent device: writes accepted, nothing answers, no echo
         if self.echo:
@@ -315,7 +369,13 @@ class CivSerialFake:
             return
         delay = self._identity_delay_s if parsed.command == _CMD_TRANSCEIVER_ID else 0.0
         if delay > 0.0:
-            asyncio.get_running_loop().call_later(delay, connection.deliver, reply)
+            baud = connection.baud  # a reply sent at this rate is noise at another
+
+            def deliver_late() -> None:
+                if connection.baud == baud:
+                    connection.deliver(reply)
+
+            asyncio.get_running_loop().call_later(delay, deliver_late)
         else:
             connection.deliver(reply)
 
@@ -409,9 +469,12 @@ class _Connection:
     radio can tell a reconnect (ordinal >= 2) from the first open.
     """
 
-    def __init__(self, fake: CivSerialFake, ordinal: int) -> None:
+    def __init__(
+        self, fake: CivSerialFake, ordinal: int, baud: int | None = None
+    ) -> None:
         self._fake = fake
         self.ordinal = ordinal
+        self.baud = baud
         self.reader = asyncio.StreamReader()
         self.writer = _FakeSerialWriter(fake, self)
         self.error: OSError | None = None
@@ -424,6 +487,29 @@ class _Connection:
     def deliver(self, data: bytes) -> None:
         if self.error is None:
             self.reader.feed_data(data)
+
+
+class _FakeSerialPort:
+    """The pyserial object behind a fake transport: baud and buffer reset."""
+
+    def __init__(self, connection: _Connection) -> None:
+        self._connection = connection
+
+    @property
+    def baudrate(self) -> int | None:
+        return self._connection.baud
+
+    @baudrate.setter
+    def baudrate(self, value: int) -> None:
+        self._connection.baud = int(value)
+
+    def reset_input_buffer(self) -> None:
+        pass
+
+
+class _FakeTransport:
+    def __init__(self, connection: _Connection) -> None:
+        self.serial = _FakeSerialPort(connection)
 
 
 class _FakeSerialWriter:
@@ -439,6 +525,10 @@ class _FakeSerialWriter:
         self._connection = connection
         self._buf = bytearray()
         self.closed = False
+        # ``writer.transport.serial``: where production retunes a live port.
+        self.transport: _FakeTransport | None = (
+            _FakeTransport(connection) if fake.models_baud else None
+        )
 
     def write(self, data: bytes) -> None:
         if self._connection.error is not None:
