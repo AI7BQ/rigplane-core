@@ -1218,32 +1218,6 @@ async def test_cli_web_no_loopback_graceful(
 
 
 @pytest.mark.asyncio
-async def test_cli_web_forwards_bridge_gain_values() -> None:
-    radio = AsyncMock()
-    captured: dict[str, object] = {}
-
-    class FakeWebServer:
-        def __init__(self, _radio, _cfg):
-            pass
-
-        async def start_audio_bridge(self, **kwargs):
-            captured.update(kwargs)
-
-        async def serve_forever(self, *, on_started=None):
-            on_started()
-            raise asyncio.CancelledError
-
-    args = _web_cmd_args(web_bridge="Loopback")
-    args.web_bridge_input_gain_db = 6.0
-    args.web_bridge_output_gain_db = -10.0
-    with patch("rigplane.web.server.WebServer", FakeWebServer):
-        assert await _cmd_web(radio, args) == 0
-
-    assert captured["input_gain_db"] == 6.0
-    assert captured["output_gain_db"] == -10.0
-
-
-@pytest.mark.asyncio
 async def test_cli_web_unrelated_bridge_failure_surfaces(
     capsys: pytest.CaptureFixture[str],
     caplog: pytest.LogCaptureFixture,
@@ -1850,29 +1824,169 @@ async def test_cmd_audio_bridge_list_devices_import_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cmd_audio_bridge_standalone_runs_until_cancelled() -> None:
-    """Bridge starts, runs, and stops cleanly when cancelled (standalone mode)."""
-    radio = _make_audio_capable_mock(MagicMock())
-    args = argparse.Namespace(
-        list_devices=False,
-        device="BlackHole 2ch",
-        rx_only=False,
-        input_gain_db=3.0,
-        output_gain_db=-10.0,
+@pytest.mark.parametrize("route", ["audio", "web", "deferred-web"])
+@pytest.mark.parametrize("with_gain", [False, True], ids=["identity", "gain"])
+async def test_cli_bridge_gain_flags_reach_playback_and_transmitted_pcm(
+    monkeypatch: pytest.MonkeyPatch, route: str, with_gain: bool
+) -> None:
+    """Parse and dispatch real CLI commands through real server/bridge lifetimes."""
+    import rigplane.audio.bridge as bridge_module
+    import rigplane.cli as cli
+    from rigplane.audio.backend import AudioDeviceId, AudioDeviceInfo, FakeAudioBackend
+    from rigplane.audio.lan_stream import AudioPacket
+    from rigplane.audio_bridge import SAMPLES_PER_FRAME
+    from rigplane.core.radio_protocol import RadioIdentity, RadioIdentityStatus
+    from rigplane.web.server import WebServer
+    from test_managed_tx_web_projection import _GatePort, _gate_authority
+    from test_web_audio_tx_session import _SessionLanRadio
+
+    deferred = route == "deferred-web"
+    serving = asyncio.Event()
+    servers: list[WebServer] = []
+    managed = _gate_authority()
+    backend = FakeAudioBackend(
+        [
+            AudioDeviceInfo(
+                id=AudioDeviceId(1),
+                name="Loopback",
+                input_channels=2,
+                output_channels=2,
+            )
+        ]
     )
 
-    fake_cls = _fake_bridge_cls()
-    with patch.object(_ab_mod, "AudioBridge", fake_cls):
-        task = asyncio.create_task(_cmd_audio_bridge(radio, args))
-        await asyncio.sleep(0.05)
-        task.cancel()
-        rc = await asyncio.gather(task, return_exceptions=True)
+    class Poller:
+        async def start(self) -> None:
+            pass
 
-    assert rc[0] == 0
-    assert fake_cls._init_kwargs[0]["input_gain_db"] == 3.0
-    assert fake_cls._init_kwargs[0]["output_gain_db"] == -10.0
-    fake_cls._start_mock.assert_called_once()
-    fake_cls._stop_mock.assert_called_once()
+        async def stop(self) -> None:
+            pass
+
+    class Radio(_SessionLanRadio):
+        control_connected = radio_ready = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.connected = not deferred
+            self.connection_identity = RadioIdentity(RadioIdentityStatus.CHECKING)
+
+        async def __aenter__(self) -> Radio:
+            return self
+
+        async def __aexit__(self, *_exc: object) -> None:
+            pass
+
+        def create_state_poller(self, **_kwargs: object) -> Poller:
+            return Poller()
+
+    class Listener:
+        sockets = [SimpleNamespace(getsockname=lambda: ("127.0.0.1", 8080))]
+
+        def close(self) -> None:
+            pass
+
+        async def wait_closed(self) -> None:
+            pass
+
+    radio = Radio()
+
+    async def listen(callback, **_kwargs: object) -> Listener:
+        server = callback.__self__
+        servers.append(server)
+        # Replace only the Core actuator; the server's TX predicate stays real.
+        server._production_managed_tx_port = _GatePort(managed)
+        if deferred:
+            assert server._audio_bridge is None
+            assert server._deferred_bridge_start is not None
+            radio.connected = True  # the held native identity read has answered
+        return Listener()
+
+    async def no_cache(_provider) -> dict[str, str]:
+        return {"status": "missing"}
+
+    async def config(_args: argparse.Namespace) -> LanBackendConfig:
+        return LanBackendConfig(host="127.0.0.1")
+
+    def installed_signal_handlers(_loop, _callback) -> None:
+        serving.set()
+
+    async def until(predicate) -> None:
+        async with asyncio.timeout(2):
+            while not predicate():
+                if task.done():
+                    assert await task == 0, "CLI exited before PCM reached its sink"
+                    pytest.fail("CLI exited before PCM reached its sink")
+                await asyncio.sleep(0)
+
+    monkeypatch.setattr(bridge_module, "PortAudioBackend", lambda: backend)
+    monkeypatch.setattr(cli, "_build_backend_config", config)
+    monkeypatch.setattr(cli, "create_radio", lambda _config: radio)
+    monkeypatch.setattr(cli, "guards_backend", lambda _config: False)
+    monkeypatch.setattr(cli, "check_ports_available", lambda _bindings: None)
+    # Core composition installation is outside this CLI gain contract. The
+    # accepting authority above is attached at the fake TCP-listener boundary.
+    monkeypatch.setattr(cli, "ManagedTxComposition", lambda *_a, **_kw: None)
+    monkeypatch.setattr(cli, "install_managed_tx_composition", lambda *_a: None)
+    monkeypatch.setattr(
+        "rigplane._platformdirs_migration.migrate_legacy_platformdirs", lambda: None
+    )
+    monkeypatch.setattr("rigplane.web.eibi.EiBiProvider.load_cache", no_cache)
+    monkeypatch.setattr("rigplane.web.web_startup.asyncio.start_server", listen)
+    monkeypatch.setattr(
+        "rigplane.web.server._install_shutdown_signal_handlers",
+        installed_signal_handlers,
+    )
+    if route == "audio":
+        argv = ["audio", "bridge", "--device", "Loopback"]
+        gain_prefix = "--"
+    else:
+        argv = ["web", "--no-rigctld", "--no-discovery", "--bridge"]
+        if not deferred:
+            argv.append("Loopback")
+        gain_prefix = "--bridge-"
+    # Omit flags for the identity case so argparse's public defaults are tested.
+    if with_gain:
+        argv += [
+            f"{gain_prefix}input-gain-db=6.020599913279624",
+            f"{gain_prefix}output-gain-db=-6.020599913279624",
+        ]
+    args = _build_parser().parse_args(argv)
+    task = asyncio.create_task(_run(args))
+    try:
+        await managed.ptt_down("web")
+        if route != "audio":
+            await asyncio.wait_for(serving.wait(), timeout=2)
+        await until(
+            lambda: (
+                backend.rx_streams
+                and backend.rx_streams[0].running
+                and radio.state == "transmitting"
+            )
+        )
+        frame = b"\xd0\x07\x30\xf8" * (SAMPLES_PER_FRAME // 2)  # +2000, -2000
+        radio.audio_bus._on_opus_packet(AudioPacket(ident=0x80, send_seq=1, data=frame))
+        backend.rx_streams[0].inject_frame(frame)
+        await until(lambda: backend.tx_streams[0].written_frames and radio.pushed)
+        playback = (
+            b"\xe8\x03\x18\xfc" * (SAMPLES_PER_FRAME // 2) if with_gain else frame
+        )
+        transmitted = (
+            b"\xa0\x0f\x60\xf0" * (SAMPLES_PER_FRAME // 2) if with_gain else frame
+        )
+        assert backend.tx_streams[0].written_frames == [playback]
+        assert radio.pushed == [transmitted]
+    finally:
+        task.cancel()
+        try:
+            assert await asyncio.wait_for(task, timeout=2) == 0
+        finally:
+            for server in servers:
+                await server.stop()
+            await managed.ptt_up("web")
+            await managed.close()
+    assert radio.state == "idle"
+    assert not backend.rx_streams[0].running
+    assert not backend.tx_streams[0].running
 
 
 @pytest.mark.asyncio

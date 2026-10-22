@@ -7651,6 +7651,21 @@ class WebServer:
                     return
                 gains[key] = float(value)
 
+            try:
+                self._controller.capture()
+            except ControllerError as exc:
+                await self._send_json(
+                    writer, exc.status, "Forbidden", {"error": exc.code}
+                )
+                return
+            if self._audio_bridge is not bridge or not bridge.running:
+                await _send_diag_error(
+                    writer,
+                    409,
+                    "bridge_not_running",
+                    "audio bridge must be running to adjust gain",
+                )
+                return
             bridge.set_gains(
                 input_gain_db=gains.get("inputGainDb"),
                 output_gain_db=gains.get("outputGainDb"),
