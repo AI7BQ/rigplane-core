@@ -38,6 +38,8 @@
   "core.statusbar.health.radioNotResponding": "трансивер не отвечает",
   "core.statusbar.health.radioPoweredOff": "трансивер выключен или недоступен",
   "core.statusbar.health.serverUnreachable": "сервер недоступен",
+  "core.statusbar.health.radioSessionBusy": "трансивер занят другим подключением, повторяем попытку",
+  "core.statusbar.health.operatorDisconnected": "отключено оператором",
   "core.statusbar.health.rigOffline": "трансивер не в сети",
   "core.statusbar.health.radioNotReady": "связь с трансивером деградировала — трансивер не готов",
   "core.statusbar.power.toggleOn": "Переключить питание (трансивер ON — нажмите, чтобы выключить)",
@@ -111,6 +113,7 @@
   "core.overlay.poweredOff.powerOnButton": "Включить",
   "core.overlay.poweredOff.failedPowerOn": "Не удалось включить: {detail}",
   "core.overlay.scopeDisconnected": "Панорама отключена — переподключение…",
+  "core.overlay.scopeTransmitting": "Идёт передача — радио не присылает панораму во время передачи",
   "core.overlay.audioLinkLost": "Аудиоканал потерян — переподключение…",
   "core.overlay.rxSilence": "Нет звука от радиостанции: сервер получает только цифровую тишину. В macOS выдайте разрешение на микрофон программе, которая запускает сервер, или проверьте вывод USB-аудио радиостанции.",
 
